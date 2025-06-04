@@ -176,6 +176,7 @@ prompts_data = [
     }
 ]
 ```
+Look for "https://ai.google.dev/api/generate-content?#generationconfig" for more information about config parameters.
 
 ## API Key Management States
 
