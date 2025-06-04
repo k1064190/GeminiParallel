@@ -394,7 +394,7 @@ class GeminiParallelProcessor:
                 response = client_instance.models.generate_content(
                     model=self.model_name,
                     contents=contents,
-                    generation_config=genai.types.GenerationConfig(**generation_config) # Example config if needed
+                    config=genai.types.GenerateContentConfig(**generation_config) # Example config if needed
                 )
                 response_text = response.text.strip()
                 content_type = "text+audio" if audio_path else "text-only"
