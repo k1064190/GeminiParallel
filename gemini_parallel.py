@@ -283,107 +283,218 @@ class GeminiParallelProcessor:
             f"with {self.max_workers} workers and interval {self.api_call_interval}s."
         )
 
+    def _parse_prompt_with_media_tokens(self, prompt: str, audio_files: list, video_files: list) -> list:
+        """
+        Parse prompt containing <audio> and <video> tokens and construct a content sequence.
+        
+        Args:
+            prompt (str): Text prompt containing <audio> and <video> tokens
+            audio_files: List of audio file objects/parts
+            video_files: List of video file objects/parts
+            
+        Returns:
+            list: Ordered list of content parts (text and media)
+        """
+        import re
+        
+        contents = []
+        audio_index = 0
+        video_index = 0
+        
+        # Find all tokens with their positions
+        tokens = []
+        for match in re.finditer(r'<(audio|video)>', prompt):
+            tokens.append({
+                'type': match.group(1),
+                'start': match.start(),
+                'end': match.end()
+            })
+        
+        # Sort tokens by position
+        tokens.sort(key=lambda x: x['start'])
+        
+        # Split text and insert media
+        current_pos = 0
+        
+        for token in tokens:
+            # Add text before token (if any)
+            text_before = prompt[current_pos:token['start']].strip()
+            if text_before:
+                contents.append(text_before)
+            
+            # Add corresponding media file
+            if token['type'] == 'audio' and audio_index < len(audio_files):
+                contents.append(audio_files[audio_index])
+                audio_index += 1
+                logging.debug(f"Added audio file at position {len(contents)-1}")
+            elif token['type'] == 'video' and video_index < len(video_files):
+                contents.append(video_files[video_index])
+                video_index += 1
+                logging.debug(f"Added video file at position {len(contents)-1}")
+            else:
+                logging.warning(f"No {token['type']} file available for token at position {token['start']}")
+            
+            current_pos = token['end']
+        
+        # Add remaining text after last token
+        remaining_text = prompt[current_pos:].strip()
+        if remaining_text:
+            contents.append(remaining_text)
+        
+        # Add any unused audio files at the end
+        while audio_index < len(audio_files):
+            contents.append(audio_files[audio_index])
+            audio_index += 1
+            logging.debug(f"Added unused audio file at end")
+        
+        # Add any unused video files at the end
+        while video_index < len(video_files):
+            contents.append(video_files[video_index])
+            video_index += 1
+            logging.debug(f"Added unused video file at end")
+        
+        return contents
+
     def _make_single_api_call(self, client_instance, prompt_data: dict) -> str:
         """
         Executes a single API call to the Gemini model.
         Handles retries for non-quota errors.
-        Supports both text-only and text+audio prompts.
+        Supports both text-only and text+audio/video prompts with position specification.
 
         Args:
             client_instance: An initialized genai.Client instance.
             prompt_data (dict): Dictionary containing:
-                - 'prompt' (str): The text prompt
-                - 'audio_path' (str, optional): Path to audio file
-                - 'audio_bytes' (bytes, optional): Audio bytes
-                - 'video_url' (str, optional): URL of video file
-                - 'video_path' (str, optional): Path to video file
-                - 'video_bytes' (bytes, optional): Video bytes
-                - 'audio_mime_type' (str, optional): MIME type of audio file (e.g., 'audio/mp3')
-                - 'video_mime_type' (str, optional): MIME type of video file (e.g., 'video/mp4')
-                - 'video_metadata' (dict, optional): Metadata for video file (e.g., {start_offset='1250s', end_offset='1570s', fps=5})
-                - 'generation_config' (dict, optional): Generation config for the API call (refer to "https://ai.google.dev/api/generate-content?#generationconfig")
+                - 'prompt' (str): The text prompt (can contain <audio> and <video> tokens for positioning)
+                - 'audio_path' (str or list[str], optional): Path(s) to audio file(s)
+                - 'audio_bytes' (bytes or list[bytes], optional): Audio bytes
+                - 'video_url' (str or list[str], optional): URL(s) of video file(s)
+                - 'video_path' (str or list[str], optional): Path(s) to video file(s)
+                - 'video_bytes' (bytes or list[bytes], optional): Video bytes
+                - 'audio_mime_type' (str or list[str], optional): MIME type(s) of audio file(s) (e.g., 'audio/mp3')
+                - 'video_mime_type' (str or list[str], optional): MIME type(s) of video file(s) (e.g., 'video/mp4')
+                - 'video_metadata' (dict or list[dict], optional): Metadata for video file(s)
+                - 'generation_config' (dict, optional): Generation config for the API call
+        
         Instructions:
-            videos and audios bigger than 20MB are recommended to be uploaded with video_path, else use video_bytes.
-
+            - Use <audio> and <video> tokens in prompt to specify positioning
+            - Multiple tokens are supported and will be matched with files in order
+            - Videos and audios bigger than 20MB are recommended to be uploaded with paths
+            
         Returns:
             str: The raw text response from the Gemini model on success.
             str: `EXHAUSTED_MARKER` if a ResourceExhausted error occurs.
             str: `PERSISTENT_ERROR_MARKER` if other errors persist after retries.
         """
         prompt = prompt_data.get('prompt', '')
-        audio_path = prompt_data.get('audio_path')
-        audio_bytes = prompt_data.get('audio_bytes')
-        audio_mime_type = prompt_data.get('audio_mime_type', 'audio/mp3')
-        video_url = prompt_data.get('video_url')
-        video_path = prompt_data.get('video_path')
-        video_bytes = prompt_data.get('video_bytes')
-        video_mime_type = prompt_data.get('video_mime_type', 'video/mp4')
-        video_metadata = prompt_data.get('video_metadata', {})
+        
+        # Handle both single values and lists for all media parameters
+        def ensure_list(value):
+            if value is None:
+                return []
+            return value if isinstance(value, list) else [value]
+        
+        audio_paths = ensure_list(prompt_data.get('audio_path'))
+        audio_bytes_list = ensure_list(prompt_data.get('audio_bytes'))
+        audio_mime_types = ensure_list(prompt_data.get('audio_mime_type', 'audio/mp3'))
+        video_urls = ensure_list(prompt_data.get('video_url'))
+        video_paths = ensure_list(prompt_data.get('video_path'))
+        video_bytes_list = ensure_list(prompt_data.get('video_bytes'))
+        video_mime_types = ensure_list(prompt_data.get('video_mime_type', 'video/mp4'))
+        video_metadata_list = ensure_list(prompt_data.get('video_metadata', {}))
         generation_config = prompt_data.get('generation_config', {})
 
-        # Prepare contents for API call
-        contents = []
-
-        if video_url:
+        # Prepare video files
+        video_files = []
+        
+        # Process video URLs
+        for i, video_url in enumerate(video_urls):
             try:
+                video_metadata = video_metadata_list[i] if i < len(video_metadata_list) else {}
                 video_part = types.Part(
                     file_data=types.FileData(file_url=video_url),
                     video_metadata=types.VideoMetadata(**video_metadata)
                 )
-                contents.append(video_part)
-                logging.debug(f"Added video file: {video_url}")
+                video_files.append(video_part)
+                logging.debug(f"Added video URL: {video_url}")
             except Exception as e:
-                logging.error(f"Failed to read video file {video_url}: {e}")
+                logging.error(f"Failed to process video URL {video_url}: {e}")
                 return PERSISTENT_ERROR_MARKER
-        elif video_path and os.path.exists(video_path):
-            try:
-                video_file = client_instance.files.upload(file=video_path)
-                contents.append(video_file)
-                logging.debug(f"Added video file: {video_path}")
-            except Exception as e:
-                logging.error(f"Failed to upload video file {video_path}: {e}")
+        
+        # Process video paths
+        for i, video_path in enumerate(video_paths):
+            if os.path.exists(video_path):
+                try:
+                    video_file = client_instance.files.upload(file=video_path)
+                    video_files.append(video_file)
+                    logging.debug(f"Added video file: {video_path}")
+                except Exception as e:
+                    logging.error(f"Failed to upload video file {video_path}: {e}")
+                    return PERSISTENT_ERROR_MARKER
+            else:
+                logging.error(f"Video file not found: {video_path}")
                 return PERSISTENT_ERROR_MARKER
-        elif video_bytes:
+        
+        # Process video bytes
+        for i, video_bytes in enumerate(video_bytes_list):
             try:
+                video_mime_type = video_mime_types[i] if i < len(video_mime_types) else 'video/mp4'
+                video_metadata = video_metadata_list[i] if i < len(video_metadata_list) else {}
                 video_part = types.Part(
                     inline_data=types.Blob(data=video_bytes, mime_type=video_mime_type),
                     video_metadata=types.VideoMetadata(**video_metadata)
                 )
-                contents.append(video_part)
+                video_files.append(video_part)
                 logging.debug(f"Added video bytes: {video_mime_type}")
             except Exception as e:
                 logging.error(f"Failed to create video part from bytes: {e}")
                 return PERSISTENT_ERROR_MARKER
 
-        # Add audio if provided
-        if audio_path and os.path.exists(audio_path):
-            try:
-                audio_file = client_instance.files.upload(file=audio_path)
-                contents.append(audio_file)
-                logging.debug(f"Added audio file: {audio_path})")
-                
-            except Exception as e:
-                logging.error(f"Failed to read audio file {audio_path}: {e}")
+        # Prepare audio files
+        audio_files = []
+        
+        # Process audio paths
+        for i, audio_path in enumerate(audio_paths):
+            if os.path.exists(audio_path):
+                try:
+                    audio_file = client_instance.files.upload(file=audio_path)
+                    audio_files.append(audio_file)
+                    logging.debug(f"Added audio file: {audio_path}")
+                except Exception as e:
+                    logging.error(f"Failed to upload audio file {audio_path}: {e}")
+                    return PERSISTENT_ERROR_MARKER
+            else:
+                logging.error(f"Audio file not found: {audio_path}")
                 return PERSISTENT_ERROR_MARKER
-        elif audio_bytes:
+        
+        # Process audio bytes
+        for i, audio_bytes in enumerate(audio_bytes_list):
             try:
+                audio_mime_type = audio_mime_types[i] if i < len(audio_mime_types) else 'audio/mp3'
                 audio_part = types.Part.from_bytes(
                     data=audio_bytes,
                     mime_type=audio_mime_type
                 )
-                contents.append(audio_part)
+                audio_files.append(audio_part)
                 logging.debug(f"Added audio bytes: {audio_mime_type}")
             except Exception as e:
                 logging.error(f"Failed to create audio part from bytes: {e}")
                 return PERSISTENT_ERROR_MARKER
 
-        # Add text prompt if provided
-        if prompt:
-            contents.append(prompt)
+        # Parse prompt and construct contents with proper positioning
+        if prompt and ('<audio>' in prompt or '<video>' in prompt):
+            # Use token-based positioning
+            contents = self._parse_prompt_with_media_tokens(prompt, audio_files, video_files)
+        else:
+            # Fallback to original behavior: video + audio + text
+            contents = []
+            contents.extend(video_files)
+            contents.extend(audio_files)
+            if prompt:
+                contents.append(prompt)
         
         # Ensure we have some content
         if not contents:
-            logging.error("No content provided (neither prompt nor audio)")
+            logging.error("No content provided (neither prompt nor media files)")
             return PERSISTENT_ERROR_MARKER
         
         # Perform API call with retries
@@ -394,10 +505,13 @@ class GeminiParallelProcessor:
                 response = client_instance.models.generate_content(
                     model=self.model_name,
                     contents=contents,
-                    config=genai.types.GenerateContentConfig(**generation_config) # Example config if needed
+                    config=genai.types.GenerateContentConfig(**generation_config)
                 )
                 response_text = response.text.strip()
-                content_type = "text+audio" if audio_path else "text-only"
+                
+                # Log content types for debugging
+                media_count = len(audio_files) + len(video_files)
+                content_type = f"text+{media_count}media" if media_count > 0 else "text-only"
                 logging.debug(f"API call successful ({content_type}). Response length: {len(response_text)}.")
                 return response_text
 
@@ -511,24 +625,34 @@ class GeminiParallelProcessor:
     def process_prompts(self, prompts_with_metadata: list[dict]) -> list[tuple]:
         """
         Processes a list of prompts in parallel using the managed API keys.
-        Supports both text-only and text+audio inputs.
+        Supports text-only and multimedia inputs with flexible positioning.
 
         Args:
             prompts_with_metadata (list[dict]): A list of dictionaries, where each
                                                 dictionary can contain:
                                                 - 'prompt' (str): The text prompt to send to Gemini.
-                                                - 'audio_path' (str, optional): Path to audio file.
-                                                - 'audio_mime_type' (str, optional): MIME type of audio (default: 'audio/mp3').
-                                                - 'video_url' (str, optional): URL of video file.
-                                                - 'video_path' (str, optional): Path to video file.
-                                                - 'video_bytes' (bytes, optional): Video bytes.
-                                                - 'video_mime_type' (str, optional): MIME type of video (default: 'video/mp4').
-                                                - 'video_metadata' (dict, optional): Metadata for video file (e.g., {'start_offset='1250s', end_offset='1570s', fps=5}).
-                                                - 'generation_config' (dict, optional): Generation config for the API call (refer to "https://ai.google.dev/api/generate-content?#generationconfig").
+                                                  Can contain <audio> and <video> tokens for positioning.
+                                                - 'audio_path' (str or list[str], optional): Path(s) to audio file(s).
+                                                - 'audio_bytes' (bytes or list[bytes], optional): Audio bytes.
+                                                - 'audio_mime_type' (str or list[str], optional): MIME type(s) of audio (default: 'audio/mp3').
+                                                - 'video_url' (str or list[str], optional): URL(s) of video file(s).
+                                                - 'video_path' (str or list[str], optional): Path(s) to video file(s).
+                                                - 'video_bytes' (bytes or list[bytes], optional): Video bytes.
+                                                - 'video_mime_type' (str or list[str], optional): MIME type(s) of video (default: 'video/mp4').
+                                                - 'video_metadata' (dict or list[dict], optional): Metadata for video file(s).
+                                                - 'generation_config' (dict, optional): Generation config for the API call.
                                                 - 'metadata' (dict): A dictionary of any
                                                   additional data associated with this prompt
                                                   (e.g., original line index, task info).
                                                   It's recommended to include a 'task_id' for logging.
+
+        Example usage with positioning:
+            prompts_with_metadata = [{
+                'prompt': 'Analyze this audio: <audio> Then compare with this video: <video> What do you think about <audio>?',
+                'audio_path': ['audio1.mp3', 'audio2.mp3'],
+                'video_path': ['video1.mp4'],
+                'metadata': {'task_id': 'multimedia_analysis_1'}
+            }]
 
         Returns:
             list[tuple]: A list of tuples, where each tuple contains:

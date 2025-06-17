@@ -6,7 +6,9 @@ A robust Python library for making parallel API calls to Google's Gemini AI mode
 
 - **Parallel Processing**: Execute multiple Gemini API calls simultaneously with configurable worker threads
 - **Advanced API Key Management**: Intelligent key rotation with cooldown periods and exhaustion recovery
-- **Multi-Modal Support**: Process text, audio, and video inputs seamlessly
+- **Multi-Modal Support**: Process text, audio, and video inputs with flexible positioning using `<audio>` and `<video>` tokens
+- **Multiple Media Files**: Support for multiple audio/video files per prompt with precise positioning control
+- **Flexible Input Methods**: Support file paths, raw bytes, and URLs for media content
 - **Resilient Error Handling**: Automatic retries, exponential backoff, and graceful degradation
 - **Resource Management**: Smart handling of rate limits and quota exhaustion
 - **Comprehensive Logging**: Detailed logging for monitoring and debugging
@@ -84,52 +86,187 @@ for metadata, response, error in results:
 
 ## Multi-Modal Usage
 
-Make sure to use audio_path when videos or audios are above 20MB.
-### Text + Audio Processing
+The library supports flexible positioning of multimedia content using `<audio>` and `<video>` tokens in your prompts. This allows you to specify exactly where each media file should appear in the context.
+
+**Note**: Use file paths (`audio_path`, `video_path`) when files are above 20MB for better performance.
+
+### Basic Multi-Modal Processing
+
 ```python
+# Simple text + audio
 prompts_data = [
     {
         "prompt": "Transcribe and summarize this audio:",
         "audio_path": "/path/to/audio/file.mp3",
         "audio_mime_type": "audio/mp3",
         "metadata": {"task_id": "audio_task_1"}
-    },
-    {
-        "prompt": "What is being discussed in this audio?",
-        "audio_bytes": open("audio.wav", "rb").read(),
-        "audio_mime_type": "audio/wav",
-        "metadata": {"task_id": "audio_task_2"}
     }
 ]
 
 results = processor.process_prompts(prompts_data)
 ```
 
-### Video Processing
+### Advanced Positioning with Tokens
+
+Use `<audio>` and `<video>` tokens to specify exact placement of media files:
 
 ```python
 prompts_data = [
     {
-        "prompt": "Describe what happens in this video:",
-        "video_path": "/path/to/video.mp4",
-        "video_mime_type": "video/mp4",
-        "metadata": {"task_id": "video_task_1"}
-    },
-    {
-        "prompt": "Analyze this video content:",
-        "video_url": "https://youtube.com/video.mp4",
-        "video_metadata": {"fps": 5},
-        "metadata": {"task_id": "video_task_2"}
-    },
-    {
-        "prompt": "Analyze this video content:",
-        "video_url": "https://youtube.com/video.mp4",
-        "video_metadata": {"start_offset"="1250s", "end_offset"="1570s"},
-        "metadata": {"task_id": "video_task_2"}
-    },
+        "prompt": "First, analyze this audio: <audio> Now compare it with this video: <video> Finally, what do you think about this second audio: <audio>",
+        "audio_path": ["audio1.mp3", "audio2.wav"],
+        "video_path": ["video1.mp4"],
+        "metadata": {"task_id": "multimedia_analysis"}
+    }
 ]
 
-results = processor.process_prompts(prompts_data)
+# This creates the sequence: text → audio1.mp3 → text → video1.mp4 → text → audio2.wav
+```
+
+### Multiple Files with Mixed Types
+
+```python
+prompts_data = [
+    {
+        "prompt": "Compare these recordings: <audio> <audio> with this visual content: <video>",
+        "audio_path": ["interview1.mp3", "interview2.mp3"],
+        "video_path": ["presentation.mp4"],
+        "audio_mime_type": ["audio/mp3", "audio/mp3"],
+        "video_mime_type": ["video/mp4"],
+        "metadata": {"task_id": "comparison_task"}
+    }
+]
+```
+
+### Using Different Input Methods
+
+```python
+# Mix of paths, bytes, and URLs
+prompts_data = [
+    {
+        "prompt": "Analyze this audio file: <audio> and this video: <video> then this audio data: <audio>",
+        "audio_path": ["/path/to/audio1.mp3"],  # File path
+        "audio_bytes": [open("audio2.wav", "rb").read()],  # Raw bytes
+        "video_url": ["https://example.com/video.mp4"],  # URL
+        "audio_mime_type": ["audio/mp3", "audio/wav"],
+        "video_mime_type": ["video/mp4"],
+        "metadata": {"task_id": "mixed_input_task"}
+    }
+]
+```
+
+### Video Processing with Metadata
+
+```python
+prompts_data = [
+    {
+        "prompt": "Analyze this video segment: <video> What are the key points?",
+        "video_path": ["/path/to/video.mp4"],
+        "video_metadata": [{"start_offset": "1250s", "end_offset": "1570s", "fps": 5}],
+        "metadata": {"task_id": "video_segment_analysis"}
+    },
+    {
+        "prompt": "Compare these two video clips: <video> <video>",
+        "video_url": ["https://example.com/video1.mp4", "https://example.com/video2.mp4"],
+        "video_metadata": [{"fps": 10}, {"start_offset": "30s", "end_offset": "60s"}],
+        "metadata": {"task_id": "video_comparison"}
+    }
+]
+```
+
+### Complex Multi-Modal Scenarios
+
+```python
+# Advanced example with multiple media types and precise positioning
+prompts_data = [
+    {
+        "prompt": """
+        I need you to analyze this presentation. 
+        
+        First, listen to the introduction: <audio>
+        
+        Now watch the main content: <video>
+        
+        Then listen to the Q&A section: <audio>
+        
+        Finally, review this supplementary video: <video>
+        
+        Please provide a comprehensive summary covering all aspects.
+        """,
+        "audio_path": ["intro.mp3", "qa_session.mp3"],
+        "video_path": ["main_presentation.mp4", "supplementary.mp4"],
+        "audio_mime_type": ["audio/mp3", "audio/mp3"],
+        "video_mime_type": ["video/mp4", "video/mp4"],
+        "video_metadata": [{"fps": 5}, {"start_offset": "0s", "end_offset": "300s"}],
+        "metadata": {"task_id": "comprehensive_analysis"}
+    }
+]
+```
+
+### Fallback Behavior
+
+If you don't use positioning tokens, the library falls back to the original behavior:
+
+```python
+# Without tokens - media files are added before the text
+prompts_data = [
+    {
+        "prompt": "Analyze the provided media files.",
+        "audio_path": ["audio1.mp3", "audio2.mp3"],
+        "video_path": ["video1.mp4"],
+        "metadata": {"task_id": "fallback_example"}
+    }
+]
+# Order: video1.mp4 → audio1.mp3 → audio2.mp3 → text
+```
+
+## Media Token Reference
+
+### Supported Tokens
+
+- `<audio>`: Insert audio file at this position
+- `<video>`: Insert video file at this position
+
+### Token Matching Rules
+
+1. **Sequential Matching**: Tokens are matched with media files in the order they appear
+2. **Type-Specific**: `<audio>` tokens match with audio files, `<video>` tokens with video files
+3. **Unused Files**: Any unused media files are automatically appended at the end
+4. **Missing Files**: If more tokens exist than available files, a warning is logged
+
+### Supported Media Parameters
+
+| Parameter | Single Value | Multiple Values | Description |
+|-----------|--------------|-----------------|-------------|
+| `audio_path` | `str` | `list[str]` | Path(s) to audio file(s) |
+| `audio_bytes` | `bytes` | `list[bytes]` | Raw audio data |
+| `audio_mime_type` | `str` | `list[str]` | MIME type(s) (default: `audio/mp3`) |
+| `video_path` | `str` | `list[str]` | Path(s) to video file(s) |
+| `video_bytes` | `bytes` | `list[bytes]` | Raw video data |
+| `video_url` | `str` | `list[str]` | Video URL(s) |
+| `video_mime_type` | `str` | `list[str]` | MIME type(s) (default: `video/mp4`) |
+| `video_metadata` | `dict` | `list[dict]` | Video processing metadata |
+
+### Example Token Usage
+
+```python
+# Complex positioning example
+prompt = """
+Analyze this conversation:
+
+Speaker A: <audio>
+Speaker B: <audio>
+
+Now watch the presentation: <video>
+
+Final thoughts on Speaker A: <audio>
+"""
+
+# Files will be matched in order:
+# <audio> (1st) → audio_files[0]
+# <audio> (2nd) → audio_files[1] 
+# <video> (1st) → video_files[0]
+# <audio> (3rd) → audio_files[2]
 ```
 
 ## Configuration Options
