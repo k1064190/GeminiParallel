@@ -45,7 +45,8 @@ logging.basicConfig(
 
 class AdvancedApiKeyManager:
     """
-    Advanced API key manager: supports cooldown, staged exhausted states, and time-based recovery.
+    Advanced API key manager: supports worker-specific key assignment with cooldown, 
+    staged exhausted states, and time-based recovery.
     """
     def __init__(self, keylist_names, 
                  key_cooldown_seconds=DEFAULT_KEY_COOLDOWN_SECONDS,
@@ -80,11 +81,16 @@ class AdvancedApiKeyManager:
                 'status_change_time': 0,  # Status change time
                 'exhausted_count': 0,  # Consecutive exhausted count
                 'total_exhausted_count': 0,  # Total exhausted count
+                'assigned_worker': None,  # Which worker is using this key
             }
         
         self.num_keys = len(self.api_keys)
+        
+        # Worker-specific key assignments
+        self.worker_assignments = {}  # worker_id -> api_key
+        self.available_keys = set(self.api_keys)  # Keys not assigned to any worker
+        
         self._lock = threading.Lock()
-        self._next_key_index = 0
 
         logging.info(f"AdvancedApiKeyManager initialized with {self.num_keys} keys.")
         logging.info(f"Settings - Cooldown: {self.key_cooldown_seconds}s, "
@@ -128,43 +134,55 @@ class AdvancedApiKeyManager:
                     info['exhausted_count'] = 0  # Reset count
                     logging.info(f"Key ...{key[-4:]} full exhaustion recovered, now AVAILABLE")
 
-    def get_next_available_key(self):
+    def assign_key_to_worker(self, worker_id: str):
         """
-        Return the next available API key.
-        Considers cooldown and exhausted states for selection.
-
+        Assign a key to a specific worker. Each worker gets a dedicated key.
+        
+        Args:
+            worker_id (str): Unique identifier for the worker
+            
         Returns:
-            str: Available API key
-            str: ALL_KEYS_WAITING_MARKER if all keys are temporarily unavailable
-            None: if no usable keys are available
+            str: API key assigned to the worker
+            str: ALL_KEYS_WAITING_MARKER if no keys are available
+            None: if no usable keys exist
         """
         with self._lock:
-            # Time-based status update
+            # Update key statuses based on time
             self._update_key_status_based_on_time()
             
-            # Find available key (round robin)
-            available_key_found = None
-            initial_index = self._next_key_index
-            
-            for i in range(self.num_keys):
-                current_index = (initial_index + i) % self.num_keys
-                key = self.api_keys[current_index]
-                info = self.key_info[key]
+            # Check if worker already has a key assigned
+            if worker_id in self.worker_assignments:
+                assigned_key = self.worker_assignments[worker_id]
+                key_info = self.key_info[assigned_key]
                 
-                if info['status'] == KEY_STATUS_AVAILABLE:
-                    available_key_found = key
-                    self._next_key_index = (current_index + 1) % self.num_keys
-                    
-                    # Start key usage - change to cooldown status
-                    info['last_used_time'] = time.time()
-                    info['status'] = KEY_STATUS_COOLDOWN
-                    info['status_change_time'] = time.time()
-                    
-                    logging.debug(f"Providing key ...{key[-4:]} (now in COOLDOWN for {self.key_cooldown_seconds}s)")
+                # If assigned key is still usable (not FULLY_EXHAUSTED or FAILED_INIT), keep it
+                if key_info['status'] not in [KEY_STATUS_FULLY_EXHAUSTED, KEY_STATUS_FAILED_INIT]:
+                    logging.debug(f"Worker {worker_id} keeping assigned key ...{assigned_key[-4:]} (status: {key_info['status']})")
+                    return assigned_key
+                else:
+                    # Release the unusable key and find a new one
+                    logging.info(f"Worker {worker_id} releasing unusable key ...{assigned_key[-4:]} (status: {key_info['status']})")
+                    self._release_key_from_worker(worker_id, assigned_key)
+            
+            # Find an available key for assignment
+            available_key = None
+            for key in self.available_keys.copy():
+                key_info = self.key_info[key]
+                if key_info['status'] not in [KEY_STATUS_FULLY_EXHAUSTED, KEY_STATUS_FAILED_INIT]:
+                    available_key = key
                     break
-
-            if available_key_found is None:
-                # Analyze when no available keys exist
+            
+            if available_key is None:
+                # Check if any assigned keys can be reassigned (if their worker is done)
+                for key, info in self.key_info.items():
+                    if (info['assigned_worker'] is None and 
+                        info['status'] not in [KEY_STATUS_FULLY_EXHAUSTED, KEY_STATUS_FAILED_INIT]):
+                        available_key = key
+                        self.available_keys.add(key)
+                        break
+            
+            if available_key is None:
+                # No usable keys available
                 status_counts = {}
                 for info in self.key_info.values():
                     status = info['status']
@@ -174,11 +192,83 @@ class AdvancedApiKeyManager:
                     logging.error("FATAL: All API keys failed initialization.")
                     return None
                 
-                # Temporarily unavailable situation
-                logging.info(f"No available keys. Status: {status_counts}")
+                logging.info(f"Worker {worker_id} waiting - no available keys. Status: {status_counts}")
                 return ALL_KEYS_WAITING_MARKER
+            
+            # Assign the key to the worker
+            self.worker_assignments[worker_id] = available_key
+            self.key_info[available_key]['assigned_worker'] = worker_id
+            self.available_keys.discard(available_key)
+            
+            logging.info(f"Assigned key ...{available_key[-4:]} to worker {worker_id}")
+            return available_key
+    
+    def _release_key_from_worker(self, worker_id: str, api_key: str):
+        """Internal method to release a key from a worker."""
+        if worker_id in self.worker_assignments and self.worker_assignments[worker_id] == api_key:
+            del self.worker_assignments[worker_id]
+            self.key_info[api_key]['assigned_worker'] = None
+            self.available_keys.add(api_key)
+            logging.debug(f"Released key ...{api_key[-4:]} from worker {worker_id}")
 
-            return available_key_found
+    def release_key_from_worker(self, worker_id: str, api_key: str):
+        """
+        Release a key from a worker (public method).
+        
+        Args:
+            worker_id (str): Worker identifier
+            api_key (str): API key to release
+        """
+        with self._lock:
+            self._release_key_from_worker(worker_id, api_key)
+
+    def check_key_status(self, api_key: str) -> str:
+        """
+        Check the current status of a specific API key.
+        
+        Args:
+            api_key (str): The API key to check
+            
+        Returns:
+            str: Current status of the key
+        """
+        with self._lock:
+            self._update_key_status_based_on_time()
+            if api_key in self.key_info:
+                return self.key_info[api_key]['status']
+            return KEY_STATUS_FAILED_INIT
+
+    def can_use_key_now(self, api_key: str) -> bool:
+        """
+        Check if a key can be used immediately (not in cooldown or temporarily exhausted).
+        
+        Args:
+            api_key (str): The API key to check
+            
+        Returns:
+            bool: True if key can be used now, False otherwise
+        """
+        status = self.check_key_status(api_key)
+        return status == KEY_STATUS_AVAILABLE
+
+    def mark_key_used(self, api_key: str):
+        """
+        Mark a key as just used (put it in cooldown).
+        
+        Args:
+            api_key (str): The API key that was used
+        """
+        with self._lock:
+            if api_key not in self.key_info:
+                logging.error(f"Unknown key marked as used: {api_key}")
+                return
+            
+            info = self.key_info[api_key]
+            info['last_used_time'] = time.time()
+            info['status'] = KEY_STATUS_COOLDOWN
+            info['status_change_time'] = time.time()
+            
+            logging.debug(f"Key ...{api_key[-4:]} marked as used, now in COOLDOWN for {self.key_cooldown_seconds}s")
 
     def mark_key_exhausted(self, api_key):
         """
@@ -251,7 +341,8 @@ class AdvancedApiKeyManager:
                 summary[masked_key] = {
                     'status': info['status'],
                     'exhausted_count': info['exhausted_count'],
-                    'total_exhausted_count': info['total_exhausted_count']
+                    'total_exhausted_count': info['total_exhausted_count'],
+                    'assigned_worker': info['assigned_worker']
                 }
             
             return summary
@@ -262,7 +353,7 @@ class GeminiParallelProcessor:
     It handles API key rotation, resource exhaustion retries, and general API errors.
     """
     def __init__(self, key_manager: AdvancedApiKeyManager, model_name: str,
-                 api_call_interval: float = 0.0, max_workers: int = DEFAULT_MAX_WORKERS):
+                 api_call_interval: float = 5.0, max_workers: int = DEFAULT_MAX_WORKERS):
         """
         Initializes the parallel processor.
 
@@ -272,7 +363,7 @@ class GeminiParallelProcessor:
             api_call_interval (float): Minimum time (in seconds) to wait between
                                        consecutive API calls made by a single worker.
                                        Helps with per-key rate limits.
-            max_workers (int): The maximum number of parallel threads to use.
+            max_workers (int): The maximum number of parallel threads to use. Recommended to be less or equal to 4.
         """
         self.key_manager = key_manager
         self.model_name = model_name
@@ -551,8 +642,9 @@ class GeminiParallelProcessor:
     def _worker_task(self, prompt_data: dict) -> tuple:
         """
         Worker function executed by the thread pool.
-        Gets an API key, initializes a client, makes the API call,
-        and handles key-specific exhaustion retries with the new advanced key management.
+        Each worker gets a dedicated API key and keeps using it until it becomes unusable.
+        Workers wait for COOLDOWN and TEMPORARILY_EXHAUSTED keys, but switch when keys are
+        FULLY_EXHAUSTED or FAILED_INIT.
 
         Args:
             prompt_data (dict): A dictionary containing 'prompt' (str) and
@@ -564,38 +656,65 @@ class GeminiParallelProcessor:
         prompt = prompt_data['prompt']
         metadata = prompt_data['metadata']
         task_id = metadata.get('task_id', 'unknown_task')
+        worker_id = threading.current_thread().name
 
         if not prompt:
             logging.warning(f"Skipping task {task_id} due to empty prompt.")
             return metadata, None, "Empty prompt provided."
 
-        # Key acquisition and retry loop
+        # Get or maintain worker's assigned key
         max_key_switches = 5  # Maximum number of key switches
         key_switch_count = 0
+        current_api_key = None
         
         while key_switch_count < max_key_switches:
-            api_key = self.key_manager.get_next_available_key()
+            # Get assigned key for this worker
+            current_api_key = self.key_manager.assign_key_to_worker(worker_id)
 
-            if api_key == ALL_KEYS_WAITING_MARKER:
-                logging.info(f"Worker for {task_id} waiting - no available keys")
+            if current_api_key == ALL_KEYS_WAITING_MARKER:
+                logging.info(f"Worker {worker_id} for task {task_id} waiting - no available keys")
                 time.sleep(DEFAULT_WORKER_WAIT_SECONDS)
                 continue
-            elif api_key is None:
-                logging.error(f"Worker for {task_id} - FATAL: No usable keys")
+            elif current_api_key is None:
+                logging.error(f"Worker {worker_id} for task {task_id} - FATAL: No usable keys")
                 return metadata, None, "Fatal: No usable API keys available."
 
-            # Client initialization
-            masked_key = f"...{api_key[-4:]}" if len(api_key) > 4 else "invalid key"
+            masked_key = f"...{current_api_key[-4:]}" if len(current_api_key) > 4 else "invalid key"
+            
+            # Check if key can be used now
+            if not self.key_manager.can_use_key_now(current_api_key):
+                key_status = self.key_manager.check_key_status(current_api_key)
+                
+                if key_status in [KEY_STATUS_COOLDOWN, KEY_STATUS_TEMPORARILY_EXHAUSTED]:
+                    # Wait for the key to become available
+                    if key_status == KEY_STATUS_COOLDOWN:
+                        wait_time = self.key_manager.key_cooldown_seconds
+                        logging.debug(f"Worker {worker_id} waiting {wait_time}s for key {masked_key} cooldown")
+                    else:  # TEMPORARILY_EXHAUSTED
+                        wait_time = self.key_manager.exhausted_wait_seconds
+                        logging.info(f"Worker {worker_id} waiting {wait_time}s for key {masked_key} temporary exhaustion")
+                    
+                    time.sleep(min(wait_time, DEFAULT_WORKER_WAIT_SECONDS))
+                    continue
+                    
+                elif key_status in [KEY_STATUS_FULLY_EXHAUSTED, KEY_STATUS_FAILED_INIT]:
+                    # Key is unusable, need to switch
+                    logging.warning(f"Worker {worker_id} key {masked_key} is unusable ({key_status}), switching")
+                    self.key_manager.release_key_from_worker(worker_id, current_api_key)
+                    key_switch_count += 1
+                    continue
+
+            # Initialize client with the assigned key
             try:
-                logging.debug(f"Worker for {task_id} using key {masked_key}")
-                client_instance = genai.Client(api_key=api_key)
+                logging.debug(f"Worker {worker_id} using key {masked_key} for task {task_id}")
+                client_instance = genai.Client(api_key=current_api_key)
 
                 if self.api_call_interval > 0:
                     time.sleep(self.api_call_interval)
 
             except Exception as e:
                 logging.error(f"Failed to initialize client for {task_id} with key {masked_key}: {e}")
-                self.key_manager.mark_key_failed_init(api_key)
+                self.key_manager.mark_key_failed_init(current_api_key)
                 key_switch_count += 1
                 continue
 
@@ -603,19 +722,21 @@ class GeminiParallelProcessor:
             result = self._make_single_api_call(client_instance, prompt_data)
             
             if result == EXHAUSTED_MARKER:
-                # Key is exhausted - notify key manager and retry with different key
-                logging.warning(f"Key {masked_key} exhausted for task {task_id}, trying different key")
-                self.key_manager.mark_key_exhausted(api_key)
-                key_switch_count += 1
+                # Key is exhausted - notify key manager
+                logging.warning(f"Key {masked_key} exhausted for task {task_id}")
+                self.key_manager.mark_key_exhausted(current_api_key)
+                # Don't switch key immediately - let the key manager handle the state change
+                # Next iteration will check the key status and decide whether to wait or switch
                 continue
             elif result == PERSISTENT_ERROR_MARKER:
                 # Persistent error - treat this task as failed
                 logging.error(f"Persistent error for {task_id} with key {masked_key}")
                 return metadata, None, "Persistent API call error."
             else:
-                # Success! - reset exhausted count and return result
+                # Success! - mark key as used (cooldown) and reset exhausted count
                 logging.debug(f"Success for {task_id} with key {masked_key}")
-                self.key_manager.mark_key_successful(api_key)
+                self.key_manager.mark_key_successful(current_api_key)
+                self.key_manager.mark_key_used(current_api_key)
                 return metadata, result, None
 
         # Maximum key switch count exceeded
@@ -625,6 +746,7 @@ class GeminiParallelProcessor:
     def process_prompts(self, prompts_with_metadata: list[dict]) -> list[tuple]:
         """
         Processes a list of prompts in parallel using the managed API keys.
+        Each worker is assigned a dedicated key and keeps using it throughout their tasks.
         Supports text-only and multimedia inputs with flexible positioning.
 
         Args:
@@ -675,6 +797,8 @@ class GeminiParallelProcessor:
 
         logging.info(f"Starting parallel processing with {actual_workers} workers for {len(prompts_with_metadata)} prompts.")
         results = []
+        active_workers = set()  # Track active worker IDs for key cleanup
+        
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=actual_workers, thread_name_prefix="GeminiAPIWorker"
         ) as executor:
@@ -708,5 +832,14 @@ class GeminiParallelProcessor:
                     )
                     last_log_time = current_time
 
+        # Clean up worker key assignments after all tasks are completed
+        # Get a snapshot of current worker assignments to clean up
+        worker_assignments_snapshot = dict(self.key_manager.worker_assignments)
+        for worker_id, api_key in worker_assignments_snapshot.items():
+            if worker_id.startswith("GeminiAPIWorker"):  # Only clean up our workers
+                logging.debug(f"Releasing key ...{api_key[-4:]} from completed worker {worker_id}")
+                self.key_manager.release_key_from_worker(worker_id, api_key)
+
         logging.info(f"Parallel processing finished. Processed {processed_count} tasks.")
+        logging.info(f"Key status summary: {self.key_manager.get_keys_status_summary()}")
         return results
