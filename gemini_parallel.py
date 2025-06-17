@@ -353,7 +353,7 @@ class GeminiParallelProcessor:
     It handles API key rotation, resource exhaustion retries, and general API errors.
     """
     def __init__(self, key_manager: AdvancedApiKeyManager, model_name: str,
-                 api_call_interval: float = 5.0, max_workers: int = DEFAULT_MAX_WORKERS):
+                 api_call_interval: float = 2.0, max_workers: int = DEFAULT_MAX_WORKERS):
         """
         Initializes the parallel processor.
 
@@ -361,17 +361,22 @@ class GeminiParallelProcessor:
             key_manager (AdvancedApiKeyManager): An instance of the API key manager.
             model_name (str): The name of the Gemini model to use (e.g., "gemini-2.0-flash-001").
             api_call_interval (float): Minimum time (in seconds) to wait between
-                                       consecutive API calls made by a single worker.
-                                       Helps with per-key rate limits.
+                                       consecutive API calls made by ANY worker.
+                                       Ensures sequential timing across all workers.
             max_workers (int): The maximum number of parallel threads to use. Recommended to be less or equal to 4.
         """
         self.key_manager = key_manager
         self.model_name = model_name
         self.api_call_interval = api_call_interval
         self.max_workers = max_workers
+        
+        # Global API call timing control
+        self._last_api_call_time = 0.0
+        self._api_call_lock = threading.Lock()
+        
         logging.info(
             f"GeminiParallelProcessor initialized for model '{self.model_name}' "
-            f"with {self.max_workers} workers and interval {self.api_call_interval}s."
+            f"with {self.max_workers} workers and global interval {self.api_call_interval}s."
         )
 
     def _parse_prompt_with_media_tokens(self, prompt: str, audio_files: list, video_files: list) -> list:
@@ -593,6 +598,20 @@ class GeminiParallelProcessor:
         while retries < DEFAULT_API_CALL_RETRIES:
             response = None
             try:
+                # Global API call interval control - ensure sequential timing across all workers
+                with self._api_call_lock:
+                    current_time = time.time()
+                    time_since_last_call = current_time - self._last_api_call_time
+                    
+                    if time_since_last_call < self.api_call_interval:
+                        wait_time = self.api_call_interval - time_since_last_call
+                        worker_id = threading.current_thread().name
+                        logging.debug(f"Worker {worker_id} waiting {wait_time:.2f}s for global API interval")
+                        time.sleep(wait_time)
+                    
+                    # Update last API call time before making the call
+                    self._last_api_call_time = time.time()
+                
                 response = client_instance.models.generate_content(
                     model=self.model_name,
                     contents=contents,
@@ -708,9 +727,6 @@ class GeminiParallelProcessor:
             try:
                 logging.debug(f"Worker {worker_id} using key {masked_key} for task {task_id}")
                 client_instance = genai.Client(api_key=current_api_key)
-
-                if self.api_call_interval > 0:
-                    time.sleep(self.api_call_interval)
 
             except Exception as e:
                 logging.error(f"Failed to initialize client for {task_id} with key {masked_key}: {e}")
