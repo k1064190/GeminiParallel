@@ -1,9 +1,10 @@
 # Gemini Parallel API Processor
 
-A robust Python library for making parallel API calls to Google's Gemini AI models with advanced API key management, automatic retry mechanisms, and comprehensive error handling.
+A robust Python library for making parallel API calls to Google's Gemini AI models with advanced API key management, automatic retry mechanisms, and comprehensive error handling. Supports both **batch processing** and **streaming processing** modes.
 
 ## Features
 
+- **Dual Processing Modes**: Choose between batch processing (multiple requests at once) or streaming processing (persistent workers for real-time requests)
 - **Parallel Processing**: Execute multiple Gemini API calls simultaneously with configurable worker threads
 - **Advanced API Key Management**: Intelligent key rotation with cooldown periods and exhaustion recovery
 - **Multi-Modal Support**: Process text, audio, and video inputs with flexible positioning using `<audio>` and `<video>` tokens
@@ -42,19 +43,23 @@ GEMINI_API_KEY_4=your_fourth_api_key_here
 echo ".env" >> .gitignore
 ```
 
-## Quick Start
+## Processing Modes
+
+### 🔄 Batch Processing (Traditional)
+
+Perfect for processing large amounts of data at once. All requests are submitted together and results are returned when all are complete.
 
 ```python
 from gemini_parallel import AdvancedApiKeyManager, GeminiParallelProcessor
 
-# Initialize the API key manager (will automatically load from .env file)
+# Initialize the API key manager
 key_manager = AdvancedApiKeyManager([
     "GEMINI_API_KEY_1",
     "GEMINI_API_KEY_2", 
     "GEMINI_API_KEY_3"
 ])
 
-# Create the parallel processor
+# Create the batch processor
 processor = GeminiParallelProcessor(
     key_manager=key_manager,
     model_name="gemini-2.0-flash-001",
@@ -73,7 +78,7 @@ prompts_data = [
     }
 ]
 
-# Process in parallel
+# Process all at once
 results = processor.process_prompts(prompts_data)
 
 # Handle results
@@ -82,6 +87,225 @@ for metadata, response, error in results:
         print(f"Task {metadata['task_id']} failed: {error}")
     else:
         print(f"Task {metadata['task_id']} result: {response[:100]}...")
+```
+
+### 🚀 Streaming Processing (New!)
+
+Perfect for real-time applications, web services, and interactive systems. Maintains persistent workers and processes requests one by one as they come.
+
+```python
+from gemini_parallel import AdvancedApiKeyManager, GeminiStreamingProcessor
+
+# Initialize the API key manager
+key_manager = AdvancedApiKeyManager([
+    "GEMINI_API_KEY_1",
+    "GEMINI_API_KEY_2"
+])
+
+# Create the streaming processor
+stream_processor = GeminiStreamingProcessor(
+    key_manager=key_manager,
+    model_name="gemini-2.0-flash-001",
+    max_workers=4
+)
+
+# Start persistent workers (do this once)
+stream_processor.start()
+
+try:
+    # Process individual requests (can be called many times)
+    prompt_data = {
+        'prompt': 'What is the capital of France?',
+        'metadata': {'task_id': 'question_1'}
+    }
+    
+    # This call blocks until result is ready
+    metadata, response, error = stream_processor.process_single(prompt_data)
+    
+    if error is None:
+        print(f"Response: {response}")
+    else:
+        print(f"Error: {error}")
+    
+    # Process another request immediately
+    prompt_data2 = {
+        'prompt': 'Explain quantum physics briefly.',
+        'metadata': {'task_id': 'question_2'}
+    }
+    
+    metadata, response, error = stream_processor.process_single(prompt_data2)
+    print(f"Second response: {response}")
+    
+    # Check worker status anytime
+    status = stream_processor.get_worker_status()
+    print(f"Queue size: {status['queue_size']}")
+    print(f"Active workers: {status['active_workers']}")
+    
+finally:
+    # Always stop workers when done
+    stream_processor.stop()
+```
+
+### 🎯 When to Use Each Mode
+
+| Use Case | Batch Processing | Streaming Processing |
+|----------|-----------------|---------------------|
+| **Large Dataset Processing** | ✅ Perfect | ❌ Inefficient |
+| **Web API Backend** | ❌ Too slow | ✅ Perfect |
+| **Interactive Chatbot** | ❌ Poor UX | ✅ Perfect |
+| **Batch Analysis Jobs** | ✅ Perfect | ❌ Overkill |
+| **Real-time Applications** | ❌ Too slow | ✅ Perfect |
+| **Jupyter Notebooks** | ✅ Good | ✅ Great for testing |
+
+## Streaming Processor Advanced Usage
+
+### Error Handling with Timeout
+
+```python
+try:
+    # Set custom timeout (default: 300 seconds)
+    metadata, response, error = stream_processor.process_single(
+        prompt_data, 
+        timeout=60.0  # 1 minute timeout
+    )
+except TimeoutError:
+    print("Request timed out!")
+except RuntimeError:
+    print("Workers not running - call start() first!")
+```
+
+### Multimedia Processing with Streaming
+
+```python
+# Audio analysis
+audio_prompt = {
+    'prompt': 'Transcribe and summarize: <audio>',
+    'audio_path': '/path/to/audio.mp3',
+    'metadata': {'task_id': 'audio_analysis'}
+}
+
+metadata, response, error = stream_processor.process_single(audio_prompt)
+
+# Video analysis
+video_prompt = {
+    'prompt': 'What happens in this video: <video>',
+    'video_path': '/path/to/video.mp4',
+    'metadata': {'task_id': 'video_analysis'}
+}
+
+metadata, response, error = stream_processor.process_single(video_prompt)
+```
+
+### Worker Management
+
+```python
+# Check if workers are running
+if not stream_processor.is_running():
+    stream_processor.start()
+
+# Monitor queue
+print(f"Requests in queue: {stream_processor.get_queue_size()}")
+
+# Get detailed status
+status = stream_processor.get_worker_status()
+print(f"Workers running: {status['workers_running']}")
+print(f"Max workers: {status['max_workers']}")
+print(f"Key status: {status['key_status']}")
+
+# Stop and restart if needed
+stream_processor.stop()
+stream_processor.start()
+```
+
+### Integration with Web Frameworks
+
+#### Flask Example
+
+```python
+from flask import Flask, request, jsonify
+from gemini_parallel import AdvancedApiKeyManager, GeminiStreamingProcessor
+
+app = Flask(__name__)
+
+# Initialize once at startup
+key_manager = AdvancedApiKeyManager(["GEMINI_API_KEY_1", "GEMINI_API_KEY_2"])
+processor = GeminiStreamingProcessor(key_manager, "gemini-2.0-flash-001")
+processor.start()
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    user_message = request.json.get('message')
+    
+    prompt_data = {
+        'prompt': user_message,
+        'metadata': {'task_id': f'web_request_{request.remote_addr}'}
+    }
+    
+    try:
+        metadata, response, error = processor.process_single(prompt_data, timeout=30.0)
+        
+        if error:
+            return jsonify({'error': error}), 500
+        else:
+            return jsonify({'response': response})
+            
+    except TimeoutError:
+        return jsonify({'error': 'Request timeout'}), 408
+
+@app.teardown_appcontext
+def shutdown_processor(exception):
+    processor.stop()
+
+if __name__ == '__main__':
+    app.run()
+```
+
+#### FastAPI Example
+
+```python
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from gemini_parallel import AdvancedApiKeyManager, GeminiStreamingProcessor
+
+app = FastAPI()
+
+# Initialize at startup
+key_manager = AdvancedApiKeyManager(["GEMINI_API_KEY_1", "GEMINI_API_KEY_2"])
+processor = GeminiStreamingProcessor(key_manager, "gemini-2.0-flash-001")
+
+class ChatRequest(BaseModel):
+    message: str
+    task_id: str = None
+
+@app.on_event("startup")
+async def startup_event():
+    processor.start()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    processor.stop()
+
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    prompt_data = {
+        'prompt': request.message,
+        'metadata': {'task_id': request.task_id or 'api_request'}
+    }
+    
+    try:
+        metadata, response, error = processor.process_single(prompt_data, timeout=30.0)
+        
+        if error:
+            raise HTTPException(status_code=500, detail=error)
+        
+        return {"response": response, "task_id": metadata.get('task_id')}
+        
+    except TimeoutError:
+        raise HTTPException(status_code=408, detail="Request timeout")
+
+@app.get("/status")
+async def get_status():
+    return processor.get_worker_status()
 ```
 
 ## Multi-Modal Usage
@@ -93,7 +317,7 @@ The library supports flexible positioning of multimedia content using `<audio>` 
 ### Basic Multi-Modal Processing
 
 ```python
-# Simple text + audio
+# Works with both batch and streaming processors
 prompts_data = [
     {
         "prompt": "Transcribe and summarize this audio:",
@@ -103,7 +327,11 @@ prompts_data = [
     }
 ]
 
+# Batch processing
 results = processor.process_prompts(prompts_data)
+
+# OR Streaming processing
+metadata, response, error = stream_processor.process_single(prompts_data[0])
 ```
 
 ### Advanced Positioning with Tokens
@@ -111,96 +339,56 @@ results = processor.process_prompts(prompts_data)
 Use `<audio>` and `<video>` tokens to specify exact placement of media files:
 
 ```python
-prompts_data = [
-    {
-        "prompt": "First, analyze this audio: <audio> Now compare it with this video: <video> Finally, what do you think about this second audio: <audio>",
-        "audio_path": ["audio1.mp3", "audio2.wav"],
-        "video_path": ["video1.mp4"],
-        "metadata": {"task_id": "multimedia_analysis"}
-    }
-]
+prompt_data = {
+    "prompt": "First, analyze this audio: <audio> Now compare it with this video: <video> Finally, what do you think about this second audio: <audio>",
+    "audio_path": ["audio1.mp3", "audio2.wav"],
+    "video_path": ["video1.mp4"],
+    "metadata": {"task_id": "multimedia_analysis"}
+}
 
 # This creates the sequence: text → audio1.mp3 → text → video1.mp4 → text → audio2.wav
+
+# Use with either processor
+metadata, response, error = stream_processor.process_single(prompt_data)
 ```
 
 ### Multiple Files with Mixed Types
 
 ```python
-prompts_data = [
-    {
-        "prompt": "Compare these recordings: <audio> <audio> with this visual content: <video>",
-        "audio_path": ["interview1.mp3", "interview2.mp3"],
-        "video_path": ["presentation.mp4"],
-        "audio_mime_type": ["audio/mp3", "audio/mp3"],
-        "video_mime_type": ["video/mp4"],
-        "metadata": {"task_id": "comparison_task"}
-    }
-]
+prompt_data = {
+    "prompt": "Compare these recordings: <audio> <audio> with this visual content: <video>",
+    "audio_path": ["interview1.mp3", "interview2.mp3"],
+    "video_path": ["presentation.mp4"],
+    "audio_mime_type": ["audio/mp3", "audio/mp3"],
+    "video_mime_type": ["video/mp4"],
+    "metadata": {"task_id": "comparison_task"}
+}
 ```
 
 ### Using Different Input Methods
 
 ```python
 # Mix of paths, bytes, and URLs
-prompts_data = [
-    {
-        "prompt": "Analyze this audio file: <audio> and this video: <video> then this audio data: <audio>",
-        "audio_path": ["/path/to/audio1.mp3"],  # File path
-        "audio_bytes": [open("audio2.wav", "rb").read()],  # Raw bytes
-        "video_url": ["https://example.com/video.mp4"],  # URL
-        "audio_mime_type": ["audio/mp3", "audio/wav"],
-        "video_mime_type": ["video/mp4"],
-        "metadata": {"task_id": "mixed_input_task"}
-    }
-]
+prompt_data = {
+    "prompt": "Analyze this audio file: <audio> and this video: <video> then this audio data: <audio>",
+    "audio_path": ["/path/to/audio1.mp3"],  # File path
+    "audio_bytes": [open("audio2.wav", "rb").read()],  # Raw bytes
+    "video_url": ["https://example.com/video.mp4"],  # URL
+    "audio_mime_type": ["audio/mp3", "audio/wav"],
+    "video_mime_type": ["video/mp4"],
+    "metadata": {"task_id": "mixed_input_task"}
+}
 ```
 
 ### Video Processing with Metadata
 
 ```python
-prompts_data = [
-    {
-        "prompt": "Analyze this video segment: <video> What are the key points?",
-        "video_path": ["/path/to/video.mp4"],
-        "video_metadata": [{"start_offset": "1250s", "end_offset": "1570s", "fps": 5}],
-        "metadata": {"task_id": "video_segment_analysis"}
-    },
-    {
-        "prompt": "Compare these two video clips: <video> <video>",
-        "video_url": ["https://example.com/video1.mp4", "https://example.com/video2.mp4"],
-        "video_metadata": [{"fps": 10}, {"start_offset": "30s", "end_offset": "60s"}],
-        "metadata": {"task_id": "video_comparison"}
-    }
-]
-```
-
-### Complex Multi-Modal Scenarios
-
-```python
-# Advanced example with multiple media types and precise positioning
-prompts_data = [
-    {
-        "prompt": """
-        I need you to analyze this presentation. 
-        
-        First, listen to the introduction: <audio>
-        
-        Now watch the main content: <video>
-        
-        Then listen to the Q&A section: <audio>
-        
-        Finally, review this supplementary video: <video>
-        
-        Please provide a comprehensive summary covering all aspects.
-        """,
-        "audio_path": ["intro.mp3", "qa_session.mp3"],
-        "video_path": ["main_presentation.mp4", "supplementary.mp4"],
-        "audio_mime_type": ["audio/mp3", "audio/mp3"],
-        "video_mime_type": ["video/mp4", "video/mp4"],
-        "video_metadata": [{"fps": 5}, {"start_offset": "0s", "end_offset": "300s"}],
-        "metadata": {"task_id": "comprehensive_analysis"}
-    }
-]
+prompt_data = {
+    "prompt": "Analyze this video segment: <video> What are the key points?",
+    "video_path": ["/path/to/video.mp4"],
+    "video_metadata": [{"start_offset": "1250s", "end_offset": "1570s", "fps": 5}],
+    "metadata": {"task_id": "video_segment_analysis"}
+}
 ```
 
 ### Fallback Behavior
@@ -209,64 +397,13 @@ If you don't use positioning tokens, the library falls back to the original beha
 
 ```python
 # Without tokens - media files are added before the text
-prompts_data = [
-    {
-        "prompt": "Analyze the provided media files.",
-        "audio_path": ["audio1.mp3", "audio2.mp3"],
-        "video_path": ["video1.mp4"],
-        "metadata": {"task_id": "fallback_example"}
-    }
-]
+prompt_data = {
+    "prompt": "Analyze the provided media files.",
+    "audio_path": ["audio1.mp3", "audio2.mp3"],
+    "video_path": ["video1.mp4"],
+    "metadata": {"task_id": "fallback_example"}
+}
 # Order: video1.mp4 → audio1.mp3 → audio2.mp3 → text
-```
-
-## Media Token Reference
-
-### Supported Tokens
-
-- `<audio>`: Insert audio file at this position
-- `<video>`: Insert video file at this position
-
-### Token Matching Rules
-
-1. **Sequential Matching**: Tokens are matched with media files in the order they appear
-2. **Type-Specific**: `<audio>` tokens match with audio files, `<video>` tokens with video files
-3. **Unused Files**: Any unused media files are automatically appended at the end
-4. **Missing Files**: If more tokens exist than available files, a warning is logged
-
-### Supported Media Parameters
-
-| Parameter | Single Value | Multiple Values | Description |
-|-----------|--------------|-----------------|-------------|
-| `audio_path` | `str` | `list[str]` | Path(s) to audio file(s) |
-| `audio_bytes` | `bytes` | `list[bytes]` | Raw audio data |
-| `audio_mime_type` | `str` | `list[str]` | MIME type(s) (default: `audio/mp3`) |
-| `video_path` | `str` | `list[str]` | Path(s) to video file(s) |
-| `video_bytes` | `bytes` | `list[bytes]` | Raw video data |
-| `video_url` | `str` | `list[str]` | Video URL(s) |
-| `video_mime_type` | `str` | `list[str]` | MIME type(s) (default: `video/mp4`) |
-| `video_metadata` | `dict` | `list[dict]` | Video processing metadata |
-
-### Example Token Usage
-
-```python
-# Complex positioning example
-prompt = """
-Analyze this conversation:
-
-Speaker A: <audio>
-Speaker B: <audio>
-
-Now watch the presentation: <video>
-
-Final thoughts on Speaker A: <audio>
-"""
-
-# Files will be matched in order:
-# <audio> (1st) → audio_files[0]
-# <audio> (2nd) → audio_files[1] 
-# <video> (1st) → video_files[0]
-# <audio> (3rd) → audio_files[2]
 ```
 
 ## Configuration Options
@@ -283,14 +420,23 @@ key_manager = AdvancedApiKeyManager(
 )
 ```
 
-### GeminiParallelProcessor Parameters
+### Processor Parameters
 
 ```python
+# Batch Processor
 processor = GeminiParallelProcessor(
     key_manager=key_manager,
     model_name="gemini-2.0-flash-001",  # Gemini model to use
     api_call_interval=0.5,              # Minimum interval between API calls
     max_workers=4                       # Maximum concurrent workers
+)
+
+# Streaming Processor (same parameters)
+stream_processor = GeminiStreamingProcessor(
+    key_manager=key_manager,
+    model_name="gemini-2.0-flash-001",
+    api_call_interval=0.5,
+    max_workers=4
 )
 ```
 
@@ -299,21 +445,20 @@ processor = GeminiParallelProcessor(
 You can customize the AI response generation:
 
 ```python
-prompts_data = [
-    {
-        "prompt": "Write a creative story:",
-        "generation_config": {
-            "temperature": 0.9,
-            "top_p": 0.8,
-            "top_k": 40,
-            "max_output_tokens": 1000,
-            "candidate_count": 1
-        },
-        "metadata": {"task_id": "creative_task"}
-    }
-]
+prompt_data = {
+    "prompt": "Write a creative story:",
+    "generation_config": {
+        "temperature": 0.9,
+        "top_p": 0.8,
+        "top_k": 40,
+        "max_output_tokens": 1000,
+        "candidate_count": 1
+    },
+    "metadata": {"task_id": "creative_task"}
+}
+
+# Works with both processors
 ```
-Look for "https://ai.google.dev/api/generate-content?#generationconfig" for more information about config parameters.
 
 ## API Key Management States
 
@@ -333,6 +478,12 @@ status_summary = key_manager.get_keys_status_summary()
 for key_id, status_info in status_summary.items():
     print(f"Key {key_id}: {status_info['status']} "
           f"(exhausted: {status_info['exhausted_count']})")
+
+# For streaming processor, also check worker status
+if hasattr(processor, 'get_worker_status'):  # Streaming processor
+    worker_status = processor.get_worker_status()
+    print(f"Workers running: {worker_status['workers_running']}")
+    print(f"Queue size: {worker_status['queue_size']}")
 ```
 
 ## Error Handling
@@ -347,6 +498,7 @@ The system handles various types of errors:
 ### Result Processing
 
 ```python
+# Batch processing
 for metadata, response, error in results:
     task_id = metadata.get('task_id', 'unknown')
     
@@ -359,7 +511,30 @@ for metadata, response, error in results:
             print(f"Task {task_id}: {error}")
     else:
         print(f"Task {task_id}: Success - {len(response)} characters")
+
+# Streaming processing
+try:
+    metadata, response, error = stream_processor.process_single(prompt_data, timeout=60)
+    if error:
+        print(f"Error: {error}")
+    else:
+        print(f"Success: {response}")
+except TimeoutError:
+    print("Request timed out")
+except RuntimeError as e:
+    print(f"Runtime error: {e}")
 ```
+
+## Performance Comparison
+
+| Metric | Batch Processing | Streaming Processing |
+|--------|-----------------|---------------------|
+| **Startup Time** | Fast (per batch) | Slow (one-time) |
+| **Memory Usage** | High (batch size) | Low (constant) |
+| **Response Time** | Slow (wait for all) | Fast (immediate) |
+| **Throughput** | High (parallel) | Medium (sequential) |
+| **Resource Efficiency** | Medium | High |
+| **Use Case** | Bulk processing | Real-time requests |
 
 ## Logging Configuration
 
@@ -395,13 +570,18 @@ logging.basicConfig(
    - Add more API keys to your `.env` file
    - Reduce request rate
 
-3. **"Failed to initialize client"**
+3. **"Workers not running" (Streaming only)**
+   - Call `stream_processor.start()` before processing requests
+   - Check if `stop()` was called accidentally
+
+4. **"Request timeout" (Streaming only)**
+   - Increase timeout parameter in `process_single()`
+   - Check if workers are stuck due to key exhaustion
+
+5. **"Failed to initialize client"**
    - Check API key validity in `.env` file
    - Verify network connectivity
    - Check Google AI service status
-
-4. **"Module not found" errors**
-   - Make sure you've run `pip install google-genai google-api-core python-dotenv`
 
 ### Debug Mode
 
@@ -411,6 +591,26 @@ Enable debug logging for detailed information:
 import logging
 logging.getLogger().setLevel(logging.DEBUG)
 ```
+
+## Best Practices
+
+### For Batch Processing
+- Use when processing large datasets
+- Optimize `max_workers` based on your API quota
+- Group related tasks in same batch
+
+### For Streaming Processing
+- Always call `start()` once at application startup
+- Always call `stop()` at application shutdown
+- Use try/finally blocks to ensure cleanup
+- Monitor queue size to prevent memory issues
+- Set appropriate timeouts for your use case
+
+### For Both
+- Use multiple API keys for better throughput
+- Monitor API key status regularly
+- Handle errors gracefully
+- Use appropriate log levels in production
 
 ## License
 
