@@ -45,7 +45,7 @@ echo ".env" >> .gitignore
 
 ## Processing Modes
 
-### 🔄 Batch Processing (Traditional)
+### 🔄 Batch Processing
 
 Perfect for processing large amounts of data at once. All requests are submitted together and results are returned when all are complete.
 
@@ -63,6 +63,8 @@ key_manager = AdvancedApiKeyManager([
 processor = GeminiParallelProcessor(
     key_manager=key_manager,
     model_name="gemini-2.0-flash-001",
+    worker_cooldown_seconds=5.0,  # Worker pacing
+    api_call_interval=2.0,        # IP ban protection
     max_workers=4
 )
 
@@ -89,7 +91,7 @@ for metadata, response, error in results:
         print(f"Task {metadata['task_id']} result: {response[:100]}...")
 ```
 
-### 🚀 Streaming Processing (New!)
+### 🚀 Streaming Processing
 
 Perfect for real-time applications, web services, and interactive systems. Maintains persistent workers and processes requests one by one as they come.
 
@@ -106,6 +108,7 @@ key_manager = AdvancedApiKeyManager([
 stream_processor = GeminiStreamingProcessor(
     key_manager=key_manager,
     model_name="gemini-2.0-flash-001",
+    api_call_interval=2.0,
     max_workers=4
 )
 
@@ -150,10 +153,10 @@ finally:
 
 | Use Case | Batch Processing | Streaming Processing |
 |----------|-----------------|---------------------|
-| **Large Dataset Processing** | ✅ Perfect | ❌ Inefficient |
+| **Large Dataset Processing** | ✅ Perfect | ✅ Good |
 | **Web API Backend** | ❌ Too slow | ✅ Perfect |
 | **Interactive Chatbot** | ❌ Poor UX | ✅ Perfect |
-| **Batch Analysis Jobs** | ✅ Perfect | ❌ Overkill |
+| **Batch Analysis Jobs** | ✅ Perfect | ✅ Good |
 | **Real-time Applications** | ❌ Too slow | ✅ Perfect |
 | **Jupyter Notebooks** | ✅ Good | ✅ Great for testing |
 
@@ -413,10 +416,10 @@ prompt_data = {
 ```python
 key_manager = AdvancedApiKeyManager(
     keylist_names=["GEMINI_API_KEY_1", "GEMINI_API_KEY_2"],
-    key_cooldown_seconds=60,           # Cooldown after each key use
-    exhausted_wait_seconds=60,         # Wait time for temporary exhaustion
-    fully_exhausted_wait_seconds=43200, # Wait time for full exhaustion (12 hours)
-    max_exhausted_retries=3            # Max retries before marking fully exhausted
+    key_cooldown_seconds=30,           # Cooldown after each key use (default: 30s)
+    exhausted_wait_seconds=120,        # Wait time for temporary exhaustion (default: 120s)
+    fully_exhausted_wait_seconds=43200, # Wait time for full exhaustion (default: 12 hours)
+    max_exhausted_retries=3            # Max retries before marking fully exhausted (default: 3)
 )
 ```
 
@@ -426,16 +429,17 @@ key_manager = AdvancedApiKeyManager(
 # Batch Processor
 processor = GeminiParallelProcessor(
     key_manager=key_manager,
-    model_name="gemini-2.0-flash-001",  # Gemini model to use
-    api_call_interval=0.5,              # Minimum interval between API calls
-    max_workers=4                       # Maximum concurrent workers
+    model_name="gemini-2.0-flash-001",      # Gemini model to use
+    worker_cooldown_seconds=5.0,            # Worker cooldown between API calls (default: 5s)
+    api_call_interval=2.0,                  # Global interval between ANY API calls (default: 2s)
+    max_workers=4                           # Maximum concurrent workers
 )
 
-# Streaming Processor (same parameters)
+# Streaming Processor (same parameters except no worker_cooldown_seconds)
 stream_processor = GeminiStreamingProcessor(
     key_manager=key_manager,
     model_name="gemini-2.0-flash-001",
-    api_call_interval=0.5,
+    api_call_interval=2.0,                  # Global interval to prevent IP ban
     max_workers=4
 )
 ```
