@@ -709,7 +709,7 @@ class GeminiParallelProcessor:
             current_api_key = self.key_manager.assign_key_to_worker(worker_id)
 
             if current_api_key == ALL_KEYS_WAITING_MARKER:
-                logging.info(f"Worker {worker_id} for task {task_id} waiting - no available keys")
+                # logging.info(f"Worker {worker_id} for task {task_id} waiting - no available keys")
                 time.sleep(DEFAULT_WORKER_WAIT_SECONDS)
                 continue
             elif current_api_key is None:
@@ -720,16 +720,16 @@ class GeminiParallelProcessor:
             
             # Check if key can be used now
             if not self.key_manager.can_use_key_now(current_api_key):
-                key_status = self.key_manager.check_key_status(current_api_key)
                 
+                key_status = self.key_manager.check_key_status(current_api_key)
                 if key_status in [KEY_STATUS_COOLDOWN, KEY_STATUS_TEMPORARILY_EXHAUSTED]:
                     # Wait for the key to become available
                     if key_status == KEY_STATUS_COOLDOWN:
                         wait_time = self.key_manager.key_cooldown_seconds
-                        logging.debug(f"Worker {worker_id} waiting {wait_time}s for key {masked_key} cooldown")
+                        # logging.debug(f"Worker {worker_id} waiting {wait_time}s for key {masked_key} cooldown")
                     else:  # TEMPORARILY_EXHAUSTED
                         wait_time = self.key_manager.exhausted_wait_seconds
-                        logging.info(f"Worker {worker_id} waiting {wait_time}s for key {masked_key} temporary exhaustion")
+                        # logging.info(f"Worker {worker_id} waiting {wait_time}s for key {masked_key} temporary exhaustion")
                     
                     time.sleep(min(wait_time, DEFAULT_WORKER_WAIT_SECONDS))
                     continue
