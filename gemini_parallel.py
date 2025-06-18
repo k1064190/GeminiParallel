@@ -8,6 +8,7 @@ import concurrent.futures
 import traceback
 from google import genai
 from google.genai import types
+from google.genai import errors as genai_errors
 from google.api_core import exceptions as google_exceptions
 import dotenv
 
@@ -31,10 +32,11 @@ KEY_STATUS_FAILED_INIT = "FAILED_INIT"
 DEFAULT_MAX_WORKERS = 4
 DEFAULT_WORKER_WAIT_SECONDS = 10 # How long workers wait when all keys are exhausted
 DEFAULT_API_CALL_RETRIES = 3 # Retries for non-exhaustion errors within a single API call attempt
-DEFAULT_KEY_COOLDOWN_SECONDS = 60  # Cooldown time after key usage (1 minute)
-DEFAULT_EXHAUSTED_WAIT_SECONDS = 60  # Wait time for temporary exhaustion (1 minute)
+DEFAULT_KEY_COOLDOWN_SECONDS = 30  # Cooldown time after key usage (30 seconds)
+DEFAULT_EXHAUSTED_WAIT_SECONDS = 120  # Wait time for temporary exhaustion (120 seconds)
 DEFAULT_FULLY_EXHAUSTED_WAIT_SECONDS = 12 * 3600  # Wait time for full exhaustion (12 hours)
 DEFAULT_MAX_EXHAUSTED_RETRIES = 3  # Maximum retry count before becoming fully exhausted
+DEFAULT_ERROR_RETRY_DELAY = 30 # Delay between error retries (30 seconds)
 
 # Configure logging for the module
 logging.basicConfig(
@@ -595,6 +597,7 @@ class GeminiParallelProcessor:
         
         # Perform API call with retries
         retries = 0
+        wait_time = DEFAULT_ERROR_RETRY_DELAY
         while retries < DEFAULT_API_CALL_RETRIES:
             response = None
             try:
@@ -624,19 +627,34 @@ class GeminiParallelProcessor:
                 content_type = f"text+{media_count}media" if media_count > 0 else "text-only"
                 logging.debug(f"API call successful ({content_type}). Response length: {len(response_text)}.")
                 return response_text
-
-            except google_exceptions.ResourceExhausted as e:
-                logging.warning(f"ResourceExhausted error: {e}. Signaling exhaustion.")
-                return EXHAUSTED_MARKER
-            except (google_exceptions.GoogleAPIError, ValueError, AttributeError) as e:
-                logging.warning(
-                    f"{type(e).__name__} during API call: {e}. "
-                    f"Retry {retries + 1}/{DEFAULT_API_CALL_RETRIES}..."
-                )
-                if isinstance(e, AttributeError) and response is not None and not hasattr(response, "text"):
-                    logging.error(
-                        "Response object does not have a 'text' attribute. Available attributes: %s",
-                        dir(response)
+            except genai_errors.APIError as e:
+                # Handle different error codes based on official Gemini API documentation
+                error_code = getattr(e, 'code', None) or getattr(e, 'status_code', None)
+                
+                if error_code == 429:  # RESOURCE_EXHAUSTED
+                    logging.warning(f"RESOURCE_EXHAUSTED (429): {e}. Signaling exhaustion.")
+                    return EXHAUSTED_MARKER
+                    
+                elif error_code in [400, 403, 404]:  # Non-retryable errors
+                    # 400: INVALID_ARGUMENT, FAILED_PRECONDITION
+                    # 403: PERMISSION_DENIED  
+                    # 404: NOT_FOUND
+                    logging.error(f"Non-retryable error ({error_code}): {e}. Signaling persistent error.")
+                    return PERSISTENT_ERROR_MARKER
+                    
+                elif error_code in [500, 503, 504]:  # Retryable server errors
+                    # 500: INTERNAL - Google internal error
+                    # 503: UNAVAILABLE - Service temporarily overloaded/down
+                    # 504: DEADLINE_EXCEEDED - Service couldn't complete in time
+                    logging.warning(
+                        f"Retryable server error ({error_code}): {e}. "
+                        f"Retry {retries + 1}/{DEFAULT_API_CALL_RETRIES}..."
+                    )
+                else:
+                    # Unknown error code - treat as retryable
+                    logging.warning(
+                        f"Unknown APIError ({error_code}): {e}. "
+                        f"Retry {retries + 1}/{DEFAULT_API_CALL_RETRIES}..."
                     )
             except Exception as e:
                 logging.error(
@@ -647,9 +665,9 @@ class GeminiParallelProcessor:
 
             retries += 1
             if retries < DEFAULT_API_CALL_RETRIES:
-                wait_time = 2**retries # Exponential backoff
                 logging.info(f"Waiting {wait_time}s before retrying API call...")
                 time.sleep(wait_time)
+                wait_time = wait_time * 2**retries # Exponential backoff
             else:
                 logging.error(
                     f"Failed API call after {DEFAULT_API_CALL_RETRIES} retries."
@@ -813,6 +831,7 @@ class GeminiParallelProcessor:
 
         logging.info(f"Starting parallel processing with {actual_workers} workers for {len(prompts_with_metadata)} prompts.")
         results = []
+        errors = []
         active_workers = set()  # Track active worker IDs for key cleanup
         
         with concurrent.futures.ThreadPoolExecutor(
@@ -831,13 +850,16 @@ class GeminiParallelProcessor:
                 task_id = original_metadata.get('task_id', 'unknown_task')
                 try:
                     metadata_res, api_response_text, error_msg = future.result()
-                    results.append((metadata_res, api_response_text, error_msg))
+                    if error_msg is None:
+                        results.append((metadata_res, api_response_text, error_msg))
+                    else:
+                        errors.append((metadata_res, error_msg))
                 except Exception as exc:
+                    errors.append((original_metadata, exc))
                     logging.error(
                         f"Task for {task_id} generated an unhandled exception: {exc}",
                         exc_info=True,
                     )
-                    results.append((original_metadata, None, f"Unhandled worker exception: {exc}"))
 
                 processed_count += 1
                 current_time = time.time()
