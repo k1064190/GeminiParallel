@@ -14,6 +14,9 @@ import dotenv
 import queue
 import uuid
 
+# Import media processing utilities
+from gemini_media_processor import prepare_media_contents
+
 dotenv.load_dotenv()
 
 
@@ -32,11 +35,12 @@ KEY_STATUS_FAILED_INIT = "FAILED_INIT"
 
 # Default configuration for the parallel processor
 DEFAULT_MAX_WORKERS = 4
-DEFAULT_WORKER_WAIT_SECONDS = 10 # How long workers wait when all keys are exhausted
+DEFAULT_WORKER_WAIT_DELAY = 10 # How long workers wait when all keys are exhausted or waiting
 DEFAULT_API_CALL_RETRIES = 3 # Retries for non-exhaustion errors within a single API call attempt
 DEFAULT_KEY_COOLDOWN_SECONDS = 30  # Cooldown time after key usage (30 seconds)
-DEFAULT_EXHAUSTED_WAIT_SECONDS = 120  # Wait time for temporary exhaustion (120 seconds)
-DEFAULT_FULLY_EXHAUSTED_WAIT_SECONDS = 12 * 3600  # Wait time for full exhaustion (12 hours)
+DEFAULT_WORKER_COOLDOWN_SECONDS = 5  # Cooldown time for worker between API calls (5 seconds)
+DEFAULT_KEY_EXHAUSTED_WAIT_SECONDS = 120  # Wait time for temporary exhaustion (120 seconds)
+DEFAULT_KEY_FULLY_EXHAUSTED_WAIT_SECONDS = 12 * 3600  # Wait time for full exhaustion (12 hours)
 DEFAULT_MAX_EXHAUSTED_RETRIES = 3  # Maximum retry count before becoming fully exhausted
 DEFAULT_ERROR_RETRY_DELAY = 30 # Delay between error retries (30 seconds)
 
@@ -54,8 +58,8 @@ class AdvancedApiKeyManager:
     """
     def __init__(self, keylist_names, 
                  key_cooldown_seconds=DEFAULT_KEY_COOLDOWN_SECONDS,
-                 exhausted_wait_seconds=DEFAULT_EXHAUSTED_WAIT_SECONDS,
-                 fully_exhausted_wait_seconds=DEFAULT_FULLY_EXHAUSTED_WAIT_SECONDS,
+                 exhausted_wait_seconds=DEFAULT_KEY_EXHAUSTED_WAIT_SECONDS,
+                 fully_exhausted_wait_seconds=DEFAULT_KEY_FULLY_EXHAUSTED_WAIT_SECONDS,
                  max_exhausted_retries=DEFAULT_MAX_EXHAUSTED_RETRIES):
         """
         Initialize the advanced API key manager.
@@ -351,109 +355,111 @@ class AdvancedApiKeyManager:
             
             return summary
 
+    def get_any_available_key(self, worker_id: str = None):
+        """
+        Get any available key for immediate use (for streaming processors).
+        This method doesn't assign keys permanently to workers, allowing for more dynamic usage.
+        
+        Args:
+            worker_id (str, optional): Worker identifier for logging purposes
+            
+        Returns:
+            str: API key that can be used immediately
+            str: ALL_KEYS_WAITING_MARKER if no keys are available
+            None: if no usable keys exist
+        """
+        with self._lock:
+            # Update key statuses based on time
+            self._update_key_status_based_on_time()
+            
+            # Find any key that can be used immediately
+            available_key = None
+            for key, info in self.key_info.items():
+                if info['status'] == KEY_STATUS_AVAILABLE:
+                    available_key = key
+                    break
+            
+            if available_key is None:
+                # Check status counts for decision making
+                status_counts = {}
+                for info in self.key_info.values():
+                    status = info['status']
+                    status_counts[status] = status_counts.get(status, 0) + 1
+                
+                if status_counts.get(KEY_STATUS_FAILED_INIT, 0) == self.num_keys:
+                    logging.error("FATAL: All API keys failed initialization.")
+                    return None
+                
+                worker_msg = f" for worker {worker_id}" if worker_id else ""
+                logging.debug(f"No available keys{worker_msg}. Status: {status_counts}")
+                return ALL_KEYS_WAITING_MARKER
+            
+            # Mark key as temporarily assigned
+            self.key_info[available_key]['last_used_time'] = time.time()
+            
+            masked_key = f"...{available_key[-4:]}" if len(available_key) > 4 else "invalid key"
+            worker_msg = f" to worker {worker_id}" if worker_id else ""
+            logging.debug(f"Providing available key {masked_key}{worker_msg}")
+            return available_key
+
+    def mark_key_returned(self, api_key: str, worker_id: str = None):
+        """
+        Mark a key as returned after use (for dynamic key usage).
+        This doesn't release assignment like release_key_from_worker since the key wasn't permanently assigned.
+        
+        Args:
+            api_key (str): The API key that was used
+            worker_id (str, optional): Worker identifier for logging purposes
+        """
+        # This is essentially the same as mark_key_used, but with different semantics
+        self.mark_key_used(api_key)
+        
+        masked_key = f"...{api_key[-4:]}" if len(api_key) > 4 else "invalid key"
+        worker_msg = f" from worker {worker_id}" if worker_id else ""
+        logging.debug(f"Key {masked_key} returned{worker_msg}, now in cooldown")
+
 class GeminiParallelProcessor:
     """
     Manages parallel calls to the Gemini API using a DynamicApiKeyManager.
     It handles API key rotation, resource exhaustion retries, and general API errors.
     """
     def __init__(self, key_manager: AdvancedApiKeyManager, model_name: str,
-                 api_call_interval: float = 2.0, max_workers: int = DEFAULT_MAX_WORKERS):
+                 worker_cooldown_seconds: float = DEFAULT_WORKER_COOLDOWN_SECONDS,
+                 api_call_interval: float = 2.0, 
+                 max_workers: int = DEFAULT_MAX_WORKERS):
         """
-        Initializes the parallel processor.
+        Initializes the parallel processor with dynamic key allocation and dual cooldown system.
 
         Args:
             key_manager (AdvancedApiKeyManager): An instance of the API key manager.
             model_name (str): The name of the Gemini model to use (e.g., "gemini-2.0-flash-001").
-            api_call_interval (float): Minimum time (in seconds) to wait between
-                                       consecutive API calls made by ANY worker.
-                                       Ensures sequential timing across all workers.
+            worker_cooldown_seconds (float): Time (in seconds) each worker waits between API calls.
+                                            Workers grab any available key after cooldown expires.
+            api_call_interval (float): Minimum time (in seconds) to wait between consecutive API calls 
+                                      made by ANY worker. Prevents IP ban from too many simultaneous requests.
             max_workers (int): The maximum number of parallel threads to use. Recommended to be less or equal to 4.
         """
         self.key_manager = key_manager
         self.model_name = model_name
+        self.worker_cooldown_seconds = worker_cooldown_seconds
         self.api_call_interval = api_call_interval
         self.max_workers = max_workers
         
-        # Global API call timing control
+        # Track worker cooldowns individually
+        self.worker_last_call_time = {}  # worker_id -> last_call_timestamp
+        self.worker_lock = threading.Lock()
+        
+        # Global API call timing control (prevents IP ban)
         self._last_api_call_time = 0.0
         self._api_call_lock = threading.Lock()
         
         logging.info(
             f"GeminiParallelProcessor initialized for model '{self.model_name}' "
-            f"with {self.max_workers} workers and global interval {self.api_call_interval}s."
+            f"with {self.max_workers} workers, worker cooldown {self.worker_cooldown_seconds}s, "
+            f"and global API interval {self.api_call_interval}s."
         )
 
-    def _parse_prompt_with_media_tokens(self, prompt: str, audio_files: list, video_files: list) -> list:
-        """
-        Parse prompt containing <audio> and <video> tokens and construct a content sequence.
-        
-        Args:
-            prompt (str): Text prompt containing <audio> and <video> tokens
-            audio_files: List of audio file objects/parts
-            video_files: List of video file objects/parts
-            
-        Returns:
-            list: Ordered list of content parts (text and media)
-        """
-        import re
-        
-        contents = []
-        audio_index = 0
-        video_index = 0
-        
-        # Find all tokens with their positions
-        tokens = []
-        for match in re.finditer(r'<(audio|video)>', prompt):
-            tokens.append({
-                'type': match.group(1),
-                'start': match.start(),
-                'end': match.end()
-            })
-        
-        # Sort tokens by position
-        tokens.sort(key=lambda x: x['start'])
-        
-        # Split text and insert media
-        current_pos = 0
-        
-        for token in tokens:
-            # Add text before token (if any)
-            text_before = prompt[current_pos:token['start']].strip()
-            if text_before:
-                contents.append(text_before)
-            
-            # Add corresponding media file
-            if token['type'] == 'audio' and audio_index < len(audio_files):
-                contents.append(audio_files[audio_index])
-                audio_index += 1
-                logging.debug(f"Added audio file at position {len(contents)-1}")
-            elif token['type'] == 'video' and video_index < len(video_files):
-                contents.append(video_files[video_index])
-                video_index += 1
-                logging.debug(f"Added video file at position {len(contents)-1}")
-            else:
-                logging.warning(f"No {token['type']} file available for token at position {token['start']}")
-            
-            current_pos = token['end']
-        
-        # Add remaining text after last token
-        remaining_text = prompt[current_pos:].strip()
-        if remaining_text:
-            contents.append(remaining_text)
-        
-        # Add any unused audio files at the end
-        while audio_index < len(audio_files):
-            contents.append(audio_files[audio_index])
-            audio_index += 1
-            logging.debug(f"Added unused audio file at end")
-        
-        # Add any unused video files at the end
-        while video_index < len(video_files):
-            contents.append(video_files[video_index])
-            video_index += 1
-            logging.debug(f"Added unused video file at end")
-        
-        return contents
+
 
     def _make_single_api_call(self, client_instance, prompt_data: dict) -> str:
         """
@@ -485,117 +491,12 @@ class GeminiParallelProcessor:
             str: `EXHAUSTED_MARKER` if a ResourceExhausted error occurs.
             str: `PERSISTENT_ERROR_MARKER` if other errors persist after retries.
         """
-        prompt = prompt_data.get('prompt', '')
-        
-        # Handle both single values and lists for all media parameters
-        def ensure_list(value):
-            if value is None:
-                return []
-            return value if isinstance(value, list) else [value]
-        
-        audio_paths = ensure_list(prompt_data.get('audio_path'))
-        audio_bytes_list = ensure_list(prompt_data.get('audio_bytes'))
-        audio_mime_types = ensure_list(prompt_data.get('audio_mime_type', 'audio/mp3'))
-        video_urls = ensure_list(prompt_data.get('video_url'))
-        video_paths = ensure_list(prompt_data.get('video_path'))
-        video_bytes_list = ensure_list(prompt_data.get('video_bytes'))
-        video_mime_types = ensure_list(prompt_data.get('video_mime_type', 'video/mp4'))
-        video_metadata_list = ensure_list(prompt_data.get('video_metadata', {}))
-        generation_config = prompt_data.get('generation_config', {})
-
-        # Prepare video files
-        video_files = []
-        
-        # Process video URLs
-        for i, video_url in enumerate(video_urls):
-            try:
-                video_metadata = video_metadata_list[i] if i < len(video_metadata_list) else {}
-                video_part = types.Part(
-                    file_data=types.FileData(file_url=video_url),
-                    video_metadata=types.VideoMetadata(**video_metadata)
-                )
-                video_files.append(video_part)
-                logging.debug(f"Added video URL: {video_url}")
-            except Exception as e:
-                logging.error(f"Failed to process video URL {video_url}: {e}")
-                return PERSISTENT_ERROR_MARKER
-        
-        # Process video paths
-        for i, video_path in enumerate(video_paths):
-            if os.path.exists(video_path):
-                try:
-                    video_file = client_instance.files.upload(file=video_path)
-                    video_files.append(video_file)
-                    logging.debug(f"Added video file: {video_path}")
-                except Exception as e:
-                    logging.error(f"Failed to upload video file {video_path}: {e}")
-                    return PERSISTENT_ERROR_MARKER
-            else:
-                logging.error(f"Video file not found: {video_path}")
-                return PERSISTENT_ERROR_MARKER
-        
-        # Process video bytes
-        for i, video_bytes in enumerate(video_bytes_list):
-            try:
-                video_mime_type = video_mime_types[i] if i < len(video_mime_types) else 'video/mp4'
-                video_metadata = video_metadata_list[i] if i < len(video_metadata_list) else {}
-                video_part = types.Part(
-                    inline_data=types.Blob(data=video_bytes, mime_type=video_mime_type),
-                    video_metadata=types.VideoMetadata(**video_metadata)
-                )
-                video_files.append(video_part)
-                logging.debug(f"Added video bytes: {video_mime_type}")
-            except Exception as e:
-                logging.error(f"Failed to create video part from bytes: {e}")
-                return PERSISTENT_ERROR_MARKER
-
-        # Prepare audio files
-        audio_files = []
-        
-        # Process audio paths
-        for i, audio_path in enumerate(audio_paths):
-            if os.path.exists(audio_path):
-                try:
-                    audio_file = client_instance.files.upload(file=audio_path)
-                    audio_files.append(audio_file)
-                    logging.debug(f"Added audio file: {audio_path}")
-                except Exception as e:
-                    logging.error(f"Failed to upload audio file {audio_path}: {e}")
-                    return PERSISTENT_ERROR_MARKER
-            else:
-                logging.error(f"Audio file not found: {audio_path}")
-                return PERSISTENT_ERROR_MARKER
-        
-        # Process audio bytes
-        for i, audio_bytes in enumerate(audio_bytes_list):
-            try:
-                audio_mime_type = audio_mime_types[i] if i < len(audio_mime_types) else 'audio/mp3'
-                audio_part = types.Part.from_bytes(
-                    data=audio_bytes,
-                    mime_type=audio_mime_type
-                )
-                audio_files.append(audio_part)
-                logging.debug(f"Added audio bytes: {audio_mime_type}")
-            except Exception as e:
-                logging.error(f"Failed to create audio part from bytes: {e}")
-                return PERSISTENT_ERROR_MARKER
-
-        # Parse prompt and construct contents with proper positioning
-        if prompt and ('<audio>' in prompt or '<video>' in prompt):
-            # Use token-based positioning
-            contents = self._parse_prompt_with_media_tokens(prompt, audio_files, video_files)
-        else:
-            # Fallback to original behavior: video + audio + text
-            contents = []
-            contents.extend(video_files)
-            contents.extend(audio_files)
-            if prompt:
-                contents.append(prompt)
-        
-        # Ensure we have some content
-        if not contents:
-            logging.error("No content provided (neither prompt nor media files)")
+        # Prepare media contents using external utility
+        contents, error_msg = prepare_media_contents(client_instance, prompt_data)
+        if contents is None:
             return PERSISTENT_ERROR_MARKER
+        
+        generation_config = prompt_data.get('generation_config', {})
         
         # Perform API call with retries
         retries = 0
@@ -603,16 +504,16 @@ class GeminiParallelProcessor:
         while retries < DEFAULT_API_CALL_RETRIES:
             response = None
             try:
-                # Global API call interval control - ensure sequential timing across all workers
+                # Global API call interval control - prevents IP ban from simultaneous requests
                 with self._api_call_lock:
                     current_time = time.time()
                     time_since_last_call = current_time - self._last_api_call_time
                     
                     if time_since_last_call < self.api_call_interval:
-                        wait_time = self.api_call_interval - time_since_last_call
+                        sleep_time = self.api_call_interval - time_since_last_call
                         worker_id = threading.current_thread().name
-                        logging.debug(f"Worker {worker_id} waiting {wait_time:.2f}s for global API interval")
-                        time.sleep(wait_time)
+                        logging.debug(f"Worker {worker_id} waiting {sleep_time:.2f}s for global API interval")
+                        time.sleep(sleep_time)
                     
                     # Update last API call time before making the call
                     self._last_api_call_time = time.time()
@@ -625,10 +526,11 @@ class GeminiParallelProcessor:
                 response_text = response.text.strip()
                 
                 # Log content types for debugging
-                media_count = len(audio_files) + len(video_files)
+                media_count = sum(1 for content in contents if hasattr(content, 'file_data') or hasattr(content, 'inline_data'))
                 content_type = f"text+{media_count}media" if media_count > 0 else "text-only"
                 logging.debug(f"API call successful ({content_type}). Response length: {len(response_text)}.")
                 return response_text
+
             except genai_errors.APIError as e:
                 # Handle different error codes based on official Gemini API documentation
                 error_code = getattr(e, 'code', None) or getattr(e, 'status_code', None)
@@ -676,14 +578,16 @@ class GeminiParallelProcessor:
                 )
                 return PERSISTENT_ERROR_MARKER
 
-        return PERSISTENT_ERROR_MARKER # Should not be reached if loop conditions are correct
+        return PERSISTENT_ERROR_MARKER
 
     def _worker_task(self, prompt_data: dict) -> tuple:
         """
-        Worker function executed by the thread pool.
-        Each worker gets a dedicated API key and keeps using it until it becomes unusable.
-        Workers wait for COOLDOWN and TEMPORARILY_EXHAUSTED keys, but switch when keys are
-        FULLY_EXHAUSTED or FAILED_INIT.
+        Worker function with dynamic key allocation and worker cooldown management.
+        
+        1. Worker checks its own cooldown before attempting any work
+        2. Worker grabs any available key when ready to work  
+        3. After API call, worker enters cooldown and key enters cooldown separately
+        4. No permanent key assignment - keys are grabbed dynamically per task
 
         Args:
             prompt_data (dict): A dictionary containing 'prompt' (str) and
@@ -701,18 +605,30 @@ class GeminiParallelProcessor:
             logging.warning(f"Skipping task {task_id} due to empty prompt.")
             return metadata, None, "Empty prompt provided."
 
-        # Get or maintain worker's assigned key
-        max_key_switches = 5  # Maximum number of key switches
-        key_switch_count = 0
-        current_api_key = None
+        # Check worker cooldown first
+        with self.worker_lock:
+            current_time = time.time()
+            last_call_time = self.worker_last_call_time.get(worker_id, 0)
+            time_since_last_call = current_time - last_call_time
+            
+            if time_since_last_call < self.worker_cooldown_seconds:
+                wait_time = self.worker_cooldown_seconds - time_since_last_call
+                logging.debug(f"Worker {worker_id} in cooldown, waiting {wait_time:.1f}s")
+                time.sleep(wait_time)
+
+        # Dynamic key allocation - try to get any available key
+        max_attempts = 10000
+        attempt_count = 0
         
-        while key_switch_count < max_key_switches:
-            # Get assigned key for this worker
-            current_api_key = self.key_manager.assign_key_to_worker(worker_id)
+        while attempt_count < max_attempts:
+            # Get any available key for this task
+            current_api_key = self.key_manager.get_any_available_key(worker_id)
 
             if current_api_key == ALL_KEYS_WAITING_MARKER:
-                # logging.info(f"Worker {worker_id} for task {task_id} waiting - no available keys")
-                time.sleep(DEFAULT_WORKER_WAIT_SECONDS)
+                # All keys are busy, wait and retry
+                logging.debug(f"Worker {worker_id} waiting - all keys busy")
+                time.sleep(DEFAULT_WORKER_WAIT_DELAY)
+                attempt_count += 1
                 continue
             elif current_api_key is None:
                 logging.error(f"Worker {worker_id} for task {task_id} - FATAL: No usable keys")
@@ -720,30 +636,7 @@ class GeminiParallelProcessor:
 
             masked_key = f"...{current_api_key[-4:]}" if len(current_api_key) > 4 else "invalid key"
             
-            # Check if key can be used now
-            if not self.key_manager.can_use_key_now(current_api_key):
-                
-                key_status = self.key_manager.check_key_status(current_api_key)
-                if key_status in [KEY_STATUS_COOLDOWN, KEY_STATUS_TEMPORARILY_EXHAUSTED]:
-                    # Wait for the key to become available
-                    if key_status == KEY_STATUS_COOLDOWN:
-                        wait_time = self.key_manager.key_cooldown_seconds
-                        # logging.debug(f"Worker {worker_id} waiting {wait_time}s for key {masked_key} cooldown")
-                    else:  # TEMPORARILY_EXHAUSTED
-                        wait_time = self.key_manager.exhausted_wait_seconds
-                        # logging.info(f"Worker {worker_id} waiting {wait_time}s for key {masked_key} temporary exhaustion")
-                    
-                    time.sleep(min(wait_time, DEFAULT_WORKER_WAIT_SECONDS))
-                    continue
-                    
-                elif key_status in [KEY_STATUS_FULLY_EXHAUSTED, KEY_STATUS_FAILED_INIT]:
-                    # Key is unusable, need to switch
-                    logging.warning(f"Worker {worker_id} key {masked_key} is unusable ({key_status}), switching")
-                    self.key_manager.release_key_from_worker(worker_id, current_api_key)
-                    key_switch_count += 1
-                    continue
-
-            # Initialize client with the assigned key
+            # Initialize client with the key
             try:
                 logging.debug(f"Worker {worker_id} using key {masked_key} for task {task_id}")
                 client_instance = genai.Client(api_key=current_api_key)
@@ -751,38 +644,42 @@ class GeminiParallelProcessor:
             except Exception as e:
                 logging.error(f"Failed to initialize client for {task_id} with key {masked_key}: {e}")
                 self.key_manager.mark_key_failed_init(current_api_key)
-                key_switch_count += 1
                 continue
 
             # Perform API call
             result = self._make_single_api_call(client_instance, prompt_data)
             
             if result == EXHAUSTED_MARKER:
-                # Key is exhausted - notify key manager
-                logging.warning(f"Key {masked_key} exhausted for task {task_id}")
+                # Key is exhausted - mark it and try again with another key
+                logging.warning(f"Key {masked_key} exhausted for task {task_id}, trying another key")
                 self.key_manager.mark_key_exhausted(current_api_key)
-                # Don't switch key immediately - let the key manager handle the state change
-                # Next iteration will check the key status and decide whether to wait or switch
                 continue
             elif result == PERSISTENT_ERROR_MARKER:
                 # Persistent error - treat this task as failed
                 logging.error(f"Persistent error for {task_id} with key {masked_key}")
                 return metadata, None, "Persistent API call error."
             else:
-                # Success! - mark key as used (cooldown) and reset exhausted count
+                # Success! Update worker cooldown and key cooldown
                 logging.debug(f"Success for {task_id} with key {masked_key}")
+                
+                # Update worker's last call time for cooldown management
+                with self.worker_lock:
+                    self.worker_last_call_time[worker_id] = time.time()
+                
+                # Mark key as successful and put it in cooldown
                 self.key_manager.mark_key_successful(current_api_key)
-                self.key_manager.mark_key_used(current_api_key)
+                self.key_manager.mark_key_returned(current_api_key, worker_id)
+                
                 return metadata, result, None
 
-        # Maximum key switch count exceeded
-        logging.error(f"Task {task_id} failed after {max_key_switches} key switches")
-        return metadata, None, f"Failed after {max_key_switches} key switches"
+        # Maximum attempts exceeded
+        logging.error(f"Task {task_id} failed after {max_attempts} key allocation attempts")
+        return metadata, None, f"Failed after {max_attempts} key allocation attempts"
 
     def process_prompts(self, prompts_with_metadata: list[dict]) -> list[tuple]:
         """
-        Processes a list of prompts in parallel using the managed API keys.
-        Each worker is assigned a dedicated key and keeps using it throughout their tasks.
+        Processes a list of prompts in parallel using dynamic key allocation.
+        Workers grab any available key when ready to work, with individual worker cooldowns.
         Supports text-only and multimedia inputs with flexible positioning.
 
         Args:
@@ -834,7 +731,6 @@ class GeminiParallelProcessor:
         logging.info(f"Starting parallel processing with {actual_workers} workers for {len(prompts_with_metadata)} prompts.")
         results = []
         errors = []
-        active_workers = set()  # Track active worker IDs for key cleanup
         
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=actual_workers, thread_name_prefix="GeminiAPIWorker"
@@ -872,13 +768,13 @@ class GeminiParallelProcessor:
                     )
                     last_log_time = current_time
 
-        # Clean up worker key assignments after all tasks are completed
-        # Get a snapshot of current worker assignments to clean up
-        worker_assignments_snapshot = dict(self.key_manager.worker_assignments)
-        for worker_id, api_key in worker_assignments_snapshot.items():
-            if worker_id.startswith("GeminiAPIWorker"):  # Only clean up our workers
-                logging.debug(f"Releasing key ...{api_key[-4:]} from completed worker {worker_id}")
-                self.key_manager.release_key_from_worker(worker_id, api_key)
+        # Clean up worker cooldown tracking after all tasks are completed
+        with self.worker_lock:
+            workers_to_remove = [worker_id for worker_id in self.worker_last_call_time.keys() 
+                               if worker_id.startswith("GeminiAPIWorker")]
+            for worker_id in workers_to_remove:
+                del self.worker_last_call_time[worker_id]
+                logging.debug(f"Removed cooldown tracking for completed worker {worker_id}")
 
         logging.info(f"Parallel processing finished. Processed {processed_count} tasks.")
         logging.info(f"Key status summary: {self.key_manager.get_keys_status_summary()}")
@@ -887,7 +783,17 @@ class GeminiParallelProcessor:
 class GeminiStreamingProcessor:
     """
     Streaming version of GeminiParallelProcessor that maintains persistent workers
-    and processes single requests on-demand.
+    and processes single requests on-demand with dynamic key allocation.
+    
+    Key differences from batch processor:
+    - Persistent workers (no thread creation overhead)
+    - Dynamic key allocation (workers grab any available key)
+    - Immediate processing (no batching required)
+    - Maximum efficiency (no worker waits while other keys are available)
+    
+    Example efficiency improvement:
+    - Batch: Worker with exhausted key waits 2 minutes for recovery
+    - Stream: Worker immediately grabs another available key
     
     Usage:
         processor = GeminiStreamingProcessor(key_manager, model_name)
@@ -899,20 +805,27 @@ class GeminiStreamingProcessor:
         processor.stop()  # Stop workers when done
     """
     def __init__(self, key_manager: AdvancedApiKeyManager, model_name: str,
+                 worker_cooldown_seconds: float = DEFAULT_WORKER_COOLDOWN_SECONDS,
                  api_call_interval: float = 2.0, max_workers: int = DEFAULT_MAX_WORKERS):
         """
-        Initialize the streaming processor.
+        Initialize the streaming processor with dual cooldown system.
         
         Args:
             key_manager (AdvancedApiKeyManager): An instance of the API key manager.
             model_name (str): The name of the Gemini model to use.
-            api_call_interval (float): Minimum time between API calls.
+            worker_cooldown_seconds (float): Time (in seconds) each worker waits between API calls.
+            api_call_interval (float): Minimum time between API calls (global IP ban protection).
             max_workers (int): Maximum number of persistent worker threads.
         """
         self.key_manager = key_manager
         self.model_name = model_name
+        self.worker_cooldown_seconds = worker_cooldown_seconds
         self.api_call_interval = api_call_interval
         self.max_workers = max_workers
+        
+        # Track worker cooldowns individually
+        self.worker_last_call_time = {}  # worker_id -> last_call_timestamp
+        self.worker_lock = threading.Lock()
         
         # Global API call timing control (shared with batch processor if needed)
         self._last_api_call_time = 0.0
@@ -929,7 +842,8 @@ class GeminiStreamingProcessor:
         
         logging.info(
             f"GeminiStreamingProcessor initialized for model '{self.model_name}' "
-            f"with {self.max_workers} workers and global interval {self.api_call_interval}s."
+            f"with {self.max_workers} workers, worker cooldown {self.worker_cooldown_seconds}s, "
+            f"and global API interval {self.api_call_interval}s."
         )
 
     def start(self):
@@ -982,6 +896,14 @@ class GeminiStreamingProcessor:
             if worker_id.startswith("GeminiStreamWorker"):
                 logging.debug(f"Releasing key ...{api_key[-4:]} from stopped worker {worker_id}")
                 self.key_manager.release_key_from_worker(worker_id, api_key)
+        
+        # Clean up worker cooldown tracking
+        with self.worker_lock:
+            workers_to_remove = [worker_id for worker_id in self.worker_last_call_time.keys() 
+                               if worker_id.startswith("GeminiStreamWorker")]
+            for worker_id in workers_to_remove:
+                del self.worker_last_call_time[worker_id]
+                logging.debug(f"Removed cooldown tracking for stopped worker {worker_id}")
         
         logging.info("All persistent workers stopped.")
 
@@ -1077,8 +999,14 @@ class GeminiStreamingProcessor:
 
     def _process_single_request(self, prompt_data: dict, worker_id: str) -> tuple:
         """
-        Process a single request using the existing worker task logic.
-        This is essentially the same as _worker_task but adapted for streaming.
+        Process a single request using dynamic key allocation for maximum efficiency.
+        
+        Unlike batch processing where workers are assigned dedicated keys, streaming workers
+        grab any available key for each request. This ensures no worker is idle while 
+        other keys are available.
+        
+        Example: With 4 keys and 4 workers, if one key is exhausted, the affected worker
+        immediately tries another available key instead of waiting for recovery.
         
         Args:
             prompt_data (dict): The prompt data to process
@@ -1095,17 +1023,30 @@ class GeminiStreamingProcessor:
             logging.warning(f"Skipping task {task_id} due to empty prompt.")
             return metadata, None, "Empty prompt provided."
 
-        # Get or maintain worker's assigned key
-        max_key_switches = 5
-        key_switch_count = 0
-        current_api_key = None
+        # Check worker cooldown first
+        with self.worker_lock:
+            current_time = time.time()
+            last_call_time = self.worker_last_call_time.get(worker_id, 0)
+            time_since_last_call = current_time - last_call_time
+            
+            if time_since_last_call < self.worker_cooldown_seconds:
+                wait_time = self.worker_cooldown_seconds - time_since_last_call
+                logging.debug(f"Worker {worker_id} in cooldown, waiting {wait_time:.1f}s")
+                time.sleep(wait_time)
+
+        # Dynamic key allocation - grab any available key for each request
+        max_attempts = 10000
+        attempt_count = 0
         
-        while key_switch_count < max_key_switches:
-            # Get assigned key for this worker
-            current_api_key = self.key_manager.assign_key_to_worker(worker_id)
+        while attempt_count < max_attempts:
+            # Get any available key for this request (no permanent assignment)
+            current_api_key = self.key_manager.get_any_available_key(worker_id)
 
             if current_api_key == ALL_KEYS_WAITING_MARKER:
-                time.sleep(DEFAULT_WORKER_WAIT_SECONDS)
+                # All keys are busy, wait and retry
+                logging.debug(f"Worker {worker_id} waiting - all keys busy")
+                time.sleep(DEFAULT_WORKER_WAIT_DELAY)
+                attempt_count += 1
                 continue
             elif current_api_key is None:
                 logging.error(f"Worker {worker_id} for task {task_id} - FATAL: No usable keys")
@@ -1113,28 +1054,7 @@ class GeminiStreamingProcessor:
 
             masked_key = f"...{current_api_key[-4:]}" if len(current_api_key) > 4 else "invalid key"
             
-            # Check if key can be used now
-            if not self.key_manager.can_use_key_now(current_api_key):
-                key_status = self.key_manager.check_key_status(current_api_key)
-                
-                if key_status in [KEY_STATUS_COOLDOWN, KEY_STATUS_TEMPORARILY_EXHAUSTED]:
-                    # Wait for the key to become available
-                    if key_status == KEY_STATUS_COOLDOWN:
-                        wait_time = self.key_manager.key_cooldown_seconds
-                    else:  # TEMPORARILY_EXHAUSTED
-                        wait_time = self.key_manager.exhausted_wait_seconds
-                    
-                    time.sleep(min(wait_time, DEFAULT_WORKER_WAIT_SECONDS))
-                    continue
-                    
-                elif key_status in [KEY_STATUS_FULLY_EXHAUSTED, KEY_STATUS_FAILED_INIT]:
-                    # Key is unusable, need to switch
-                    logging.warning(f"Worker {worker_id} key {masked_key} is unusable ({key_status}), switching")
-                    self.key_manager.release_key_from_worker(worker_id, current_api_key)
-                    key_switch_count += 1
-                    continue
-
-            # Initialize client with the assigned key
+            # Initialize client with the key
             try:
                 logging.debug(f"Worker {worker_id} using key {masked_key} for task {task_id}")
                 client_instance = genai.Client(api_key=current_api_key)
@@ -1142,15 +1062,14 @@ class GeminiStreamingProcessor:
             except Exception as e:
                 logging.error(f"Failed to initialize client for {task_id} with key {masked_key}: {e}")
                 self.key_manager.mark_key_failed_init(current_api_key)
-                key_switch_count += 1
                 continue
 
-            # Perform API call using existing logic
+            # Perform API call
             result = self._make_single_api_call(client_instance, prompt_data)
             
             if result == EXHAUSTED_MARKER:
-                # Key is exhausted - notify key manager
-                logging.warning(f"Key {masked_key} exhausted for task {task_id}")
+                # Key is exhausted - mark it and try again with another key
+                logging.warning(f"Key {masked_key} exhausted for task {task_id}, trying another key")
                 self.key_manager.mark_key_exhausted(current_api_key)
                 continue
             elif result == PERSISTENT_ERROR_MARKER:
@@ -1158,136 +1077,32 @@ class GeminiStreamingProcessor:
                 logging.error(f"Persistent error for {task_id} with key {masked_key}")
                 return metadata, None, "Persistent API call error."
             else:
-                # Success!
+                # Success! Update worker cooldown and key cooldown
                 logging.debug(f"Success for {task_id} with key {masked_key}")
+                
+                # Update worker's last call time for cooldown management
+                with self.worker_lock:
+                    self.worker_last_call_time[worker_id] = time.time()
+                
+                # Mark key as successful and put it in cooldown
                 self.key_manager.mark_key_successful(current_api_key)
-                self.key_manager.mark_key_used(current_api_key)
+                self.key_manager.mark_key_returned(current_api_key, worker_id)
                 return metadata, result, None
 
-        # Maximum key switch count exceeded
-        logging.error(f"Task {task_id} failed after {max_key_switches} key switches")
-        return metadata, None, f"Failed after {max_key_switches} key switches"
+        # Maximum attempts exceeded
+        logging.error(f"Task {task_id} failed after {max_attempts} key allocation attempts")
+        return metadata, None, f"Failed after {max_attempts} key allocation attempts"
 
-    def _parse_prompt_with_media_tokens(self, prompt: str, audio_files: list, video_files: list) -> list:
-        """Reuse the media parsing logic from GeminiParallelProcessor."""
-        temp_processor = GeminiParallelProcessor(self.key_manager, self.model_name, self.api_call_interval, 1)
-        return temp_processor._parse_prompt_with_media_tokens(prompt, audio_files, video_files)
-    
     def _make_single_api_call(self, client_instance, prompt_data: dict) -> str:
         """
         Executes a single API call - same logic as GeminiParallelProcessor but optimized.
         """
-        prompt = prompt_data.get('prompt', '')
-        
-        # Handle both single values and lists for all media parameters
-        def ensure_list(value):
-            if value is None:
-                return []
-            return value if isinstance(value, list) else [value]
-        
-        audio_paths = ensure_list(prompt_data.get('audio_path'))
-        audio_bytes_list = ensure_list(prompt_data.get('audio_bytes'))
-        audio_mime_types = ensure_list(prompt_data.get('audio_mime_type', 'audio/mp3'))
-        video_urls = ensure_list(prompt_data.get('video_url'))
-        video_paths = ensure_list(prompt_data.get('video_path'))
-        video_bytes_list = ensure_list(prompt_data.get('video_bytes'))
-        video_mime_types = ensure_list(prompt_data.get('video_mime_type', 'video/mp4'))
-        video_metadata_list = ensure_list(prompt_data.get('video_metadata', {}))
-        generation_config = prompt_data.get('generation_config', {})
-
-        # Prepare video files
-        video_files = []
-        
-        # Process video URLs
-        for i, video_url in enumerate(video_urls):
-            try:
-                video_metadata = video_metadata_list[i] if i < len(video_metadata_list) else {}
-                video_part = types.Part(
-                    file_data=types.FileData(file_url=video_url),
-                    video_metadata=types.VideoMetadata(**video_metadata)
-                )
-                video_files.append(video_part)
-                logging.debug(f"Added video URL: {video_url}")
-            except Exception as e:
-                logging.error(f"Failed to process video URL {video_url}: {e}")
-                return PERSISTENT_ERROR_MARKER
-        
-        # Process video paths
-        for i, video_path in enumerate(video_paths):
-            if os.path.exists(video_path):
-                try:
-                    video_file = client_instance.files.upload(file=video_path)
-                    video_files.append(video_file)
-                    logging.debug(f"Added video file: {video_path}")
-                except Exception as e:
-                    logging.error(f"Failed to upload video file {video_path}: {e}")
-                    return PERSISTENT_ERROR_MARKER
-            else:
-                logging.error(f"Video file not found: {video_path}")
-                return PERSISTENT_ERROR_MARKER
-        
-        # Process video bytes
-        for i, video_bytes in enumerate(video_bytes_list):
-            try:
-                video_mime_type = video_mime_types[i] if i < len(video_mime_types) else 'video/mp4'
-                video_metadata = video_metadata_list[i] if i < len(video_metadata_list) else {}
-                video_part = types.Part(
-                    inline_data=types.Blob(data=video_bytes, mime_type=video_mime_type),
-                    video_metadata=types.VideoMetadata(**video_metadata)
-                )
-                video_files.append(video_part)
-                logging.debug(f"Added video bytes: {video_mime_type}")
-            except Exception as e:
-                logging.error(f"Failed to create video part from bytes: {e}")
-                return PERSISTENT_ERROR_MARKER
-
-        # Prepare audio files
-        audio_files = []
-        
-        # Process audio paths
-        for i, audio_path in enumerate(audio_paths):
-            if os.path.exists(audio_path):
-                try:
-                    audio_file = client_instance.files.upload(file=audio_path)
-                    audio_files.append(audio_file)
-                    logging.debug(f"Added audio file: {audio_path}")
-                except Exception as e:
-                    logging.error(f"Failed to upload audio file {audio_path}: {e}")
-                    return PERSISTENT_ERROR_MARKER
-            else:
-                logging.error(f"Audio file not found: {audio_path}")
-                return PERSISTENT_ERROR_MARKER
-        
-        # Process audio bytes
-        for i, audio_bytes in enumerate(audio_bytes_list):
-            try:
-                audio_mime_type = audio_mime_types[i] if i < len(audio_mime_types) else 'audio/mp3'
-                audio_part = types.Part.from_bytes(
-                    data=audio_bytes,
-                    mime_type=audio_mime_type
-                )
-                audio_files.append(audio_part)
-                logging.debug(f"Added audio bytes: {audio_mime_type}")
-            except Exception as e:
-                logging.error(f"Failed to create audio part from bytes: {e}")
-                return PERSISTENT_ERROR_MARKER
-
-        # Parse prompt and construct contents with proper positioning
-        if prompt and ('<audio>' in prompt or '<video>' in prompt):
-            # Use token-based positioning
-            contents = self._parse_prompt_with_media_tokens(prompt, audio_files, video_files)
-        else:
-            # Fallback to original behavior: video + audio + text
-            contents = []
-            contents.extend(video_files)
-            contents.extend(audio_files)
-            if prompt:
-                contents.append(prompt)
-        
-        # Ensure we have some content
-        if not contents:
-            logging.error("No content provided (neither prompt nor media files)")
+        # Prepare media contents using external utility
+        contents, error_msg = prepare_media_contents(client_instance, prompt_data)
+        if contents is None:
             return PERSISTENT_ERROR_MARKER
+        
+        generation_config = prompt_data.get('generation_config', {})
         
         # Perform API call with retries
         retries = 0
@@ -1295,7 +1110,7 @@ class GeminiStreamingProcessor:
         while retries < DEFAULT_API_CALL_RETRIES:
             response = None
             try:
-                # Global API call interval control - ensure sequential timing across all workers
+                # Global API call interval control - prevents IP ban from simultaneous requests
                 with self._api_call_lock:
                     current_time = time.time()
                     time_since_last_call = current_time - self._last_api_call_time
@@ -1317,7 +1132,7 @@ class GeminiStreamingProcessor:
                 response_text = response.text.strip()
                 
                 # Log content types for debugging
-                media_count = len(audio_files) + len(video_files)
+                media_count = sum(1 for content in contents if hasattr(content, 'file_data') or hasattr(content, 'inline_data'))
                 content_type = f"text+{media_count}media" if media_count > 0 else "text-only"
                 logging.debug(f"API call successful ({content_type}). Response length: {len(response_text)}.")
                 return response_text
@@ -1388,86 +1203,3 @@ class GeminiStreamingProcessor:
             'active_workers': len(self.worker_futures),
             'key_status': self.key_manager.get_keys_status_summary()
         }
-
-"""
-Usage Examples:
-
-# === Batch Processing (Existing Method) ===
-key_manager = AdvancedApiKeyManager(['GEMINI_API_KEY_1', 'GEMINI_API_KEY_2'])
-batch_processor = GeminiParallelProcessor(key_manager, "gemini-2.0-flash-001")
-
-prompts_with_metadata = [
-    {
-        'prompt': 'What is the capital of France?',
-        'metadata': {'task_id': 'question_1'}
-    },
-    {
-        'prompt': 'Explain quantum physics.',
-        'metadata': {'task_id': 'question_2'}
-    }
-]
-
-results = batch_processor.process_prompts(prompts_with_metadata)
-for metadata, response, error in results:
-    if error is None:
-        print(f"Task {metadata['task_id']}: {response}")
-    else:
-        print(f"Task {metadata['task_id']} failed: {error}")
-
-# === Streaming Processing (New Method) ===
-key_manager = AdvancedApiKeyManager(['GEMINI_API_KEY_1', 'GEMINI_API_KEY_2'])
-stream_processor = GeminiStreamingProcessor(key_manager, "gemini-2.0-flash-001")
-
-# Start persistent workers
-stream_processor.start()
-
-try:
-    # Process individual requests
-    prompt_data_1 = {
-        'prompt': 'What is the capital of France?',
-        'metadata': {'task_id': 'question_1'}
-    }
-    
-    # This call blocks until result is ready
-    metadata, response, error = stream_processor.process_single(prompt_data_1)
-    if error is None:
-        print(f"Response: {response}")
-    else:
-        print(f"Error: {error}")
-    
-    # Process another request immediately
-    prompt_data_2 = {
-        'prompt': 'Explain quantum physics.',
-        'metadata': {'task_id': 'question_2'}
-    }
-    
-    metadata, response, error = stream_processor.process_single(prompt_data_2)
-    if error is None:
-        print(f"Response: {response}")
-    else:
-        print(f"Error: {error}")
-    
-    # Check worker status
-    status = stream_processor.get_worker_status()
-    print(f"Worker Status: {status}")
-    
-finally:
-    # Always stop the workers when done
-    stream_processor.stop()
-
-# === Multimedia Processing with Streaming ===
-multimedia_prompt = {
-    'prompt': 'Analyze this audio: <audio> What do you hear?',
-    'audio_path': '/path/to/audio.mp3',
-    'metadata': {'task_id': 'audio_analysis'}
-}
-
-metadata, response, error = stream_processor.process_single(multimedia_prompt)
-
-# === Advantages of Streaming Processor ===
-# 1. Persistent workers - no overhead of creating/destroying threads
-# 2. Immediate response - process one request at a time
-# 3. Flexible usage - can be called from anywhere in your code
-# 4. Same key management and error handling as batch processor
-# 5. Perfect for web services, interactive applications, or incremental processing
-"""
