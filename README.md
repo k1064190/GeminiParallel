@@ -525,17 +525,6 @@ except RuntimeError as e:
     print(f"Runtime error: {e}")
 ```
 
-## Performance Comparison
-
-| Metric | Batch Processing | Streaming Processing |
-|--------|-----------------|---------------------|
-| **Startup Time** | Fast (per batch) | Slow (one-time) |
-| **Memory Usage** | High (batch size) | Low (constant) |
-| **Response Time** | Slow (wait for all) | Fast (immediate) |
-| **Throughput** | High (parallel) | Medium (sequential) |
-| **Resource Efficiency** | Medium | High |
-| **Use Case** | Bulk processing | Real-time requests |
-
 ## Logging Configuration
 
 The library uses Python's logging module. Customize as needed:
@@ -591,26 +580,6 @@ Enable debug logging for detailed information:
 import logging
 logging.getLogger().setLevel(logging.DEBUG)
 ```
-
-## Best Practices
-
-### For Batch Processing
-- Use when processing large datasets
-- Optimize `max_workers` based on your API quota
-- Group related tasks in same batch
-
-### For Streaming Processing
-- Always call `start()` once at application startup
-- Always call `stop()` at application shutdown
-- Use try/finally blocks to ensure cleanup
-- Monitor queue size to prevent memory issues
-- Set appropriate timeouts for your use case
-
-### For Both
-- Use multiple API keys for better throughput
-- Monitor API key status regularly
-- Handle errors gracefully
-- Use appropriate log levels in production
 
 ## License
 
