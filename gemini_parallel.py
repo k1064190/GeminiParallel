@@ -15,7 +15,7 @@ import queue
 import uuid
 
 # Import media processing utilities
-from gemini_media_processor import prepare_media_contents
+from .gemini_media_processor import prepare_media_contents
 
 dotenv.load_dotenv()
 
