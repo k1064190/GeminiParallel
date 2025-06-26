@@ -38,7 +38,7 @@ DEFAULT_MAX_WORKERS = 4
 DEFAULT_WORKER_WAIT_DELAY = 10 # How long workers wait when all keys are exhausted or waiting
 DEFAULT_API_CALL_RETRIES = 3 # Retries for non-exhaustion errors within a single API call attempt
 DEFAULT_KEY_COOLDOWN_SECONDS = 30  # Cooldown time after key usage (30 seconds)
-DEFAULT_WORKER_COOLDOWN_SECONDS = 30  # Cooldown time for worker between API calls (30 seconds)
+DEFAULT_WORKER_COOLDOWN_SECONDS = 20  # Cooldown time for worker between API calls (20 seconds)
 DEFAULT_KEY_EXHAUSTED_WAIT_SECONDS = 120  # Wait time for temporary exhaustion (120 seconds)
 DEFAULT_KEY_FULLY_EXHAUSTED_WAIT_SECONDS = 12 * 3600  # Wait time for full exhaustion (12 hours)
 DEFAULT_MAX_EXHAUSTED_RETRIES = 3  # Maximum retry count before becoming fully exhausted
@@ -65,7 +65,11 @@ class AdvancedApiKeyManager:
         Initialize the advanced API key manager.
 
         Args:
-            keylist_names (list[str]): List of environment variable names containing API keys
+            keylist_names (list[str] | str | int): 
+                - List of environment variable names containing API keys
+                - "all": Find all GEMINI_API_KEY_* environment variables
+                - Integer (e.g., 5): Search for GEMINI_API_KEY_1, GEMINI_API_KEY_2, ..., GEMINI_API_KEY_5
+                - Single string: Use as single environment variable name
             key_cooldown_seconds (int): Cooldown time after key usage (seconds)
             exhausted_wait_seconds (int): Wait time for temporary exhaustion (seconds)
             fully_exhausted_wait_seconds (int): Wait time for full exhaustion (seconds)
@@ -106,15 +110,57 @@ class AdvancedApiKeyManager:
                     f"Fully exhausted wait: {self.fully_exhausted_wait_seconds}s")
 
     def _load_keys(self, keylist_names):
-        """Load API keys from environment variables."""
+        """
+        Load API keys from environment variables.
+        
+        Examples:
+            - keylist_names = ["GEMINI_API_KEY_1", "GEMINI_API_KEY_2"]  # Specific key names
+            - keylist_names = "all"  # Find all GEMINI_API_KEY_* environment variables
+            - keylist_names = 5  # Load GEMINI_API_KEY_1, GEMINI_API_KEY_2, ..., GEMINI_API_KEY_5
+            - keylist_names = "SINGLE_KEY"  # Single key name
+        """
         keys = []
-        for key_name in keylist_names:
-            key = os.getenv(key_name)
-            if key and len(key) > 10:
-                keys.append(key)
-                logging.debug(f"Loaded key from {key_name}.")
-            else:
-                logging.warning(f"Environment variable '{key_name}' not found or invalid.")
+        
+        # Handle special cases
+        if keylist_names == "all":
+            # Search for all GEMINI_API_KEY* environment variables
+            logging.info("Searching for all GEMINI_API_KEY_* environment variables...")
+            for env_var, value in os.environ.items():
+                if env_var.startswith("GEMINI_API_KEY") and value and len(value) > 10:
+                    keys.append(value)
+                    logging.debug(f"Found API key from environment variable '{env_var}'.")
+        elif isinstance(keylist_names, (int, str)) and str(keylist_names).isdigit():
+            # Handle numeric input: search GEMINI_API_KEY_1, GEMINI_API_KEY_2, ..., GEMINI_API_KEY_n
+            num_keys = int(keylist_names)
+            logging.info(f"Searching for keys GEMINI_API_KEY_1 through GEMINI_API_KEY_{num_keys}...")
+            for i in range(1, num_keys + 1):
+                key_name = f"GEMINI_API_KEY_{i}"
+                key = os.getenv(key_name)
+                if key and len(key) > 10:
+                    keys.append(key)
+                    logging.debug(f"Loaded key from {key_name}.")
+                else:
+                    logging.debug(f"Environment variable '{key_name}' not found or invalid.")
+        elif isinstance(keylist_names, list):
+            # Handle list of key names (original behavior)
+            for key_name in keylist_names:
+                key = os.getenv(key_name)
+                if key and len(key) > 10:
+                    keys.append(key)
+                    logging.debug(f"Loaded key from {key_name}.")
+                else:
+                    logging.warning(f"Environment variable '{key_name}' not found or invalid.")
+        else:
+            # Handle single key name
+            key_names = [keylist_names] if isinstance(keylist_names, str) else keylist_names
+            for key_name in key_names:
+                key = os.getenv(key_name)
+                if key and len(key) > 10:
+                    keys.append(key)
+                    logging.debug(f"Loaded key from {key_name}.")
+                else:
+                    logging.warning(f"Environment variable '{key_name}' not found or invalid.")
+        
         logging.info(f"Successfully loaded {len(keys)} valid API keys.")
         return keys
 
