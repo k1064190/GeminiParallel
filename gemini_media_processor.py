@@ -119,10 +119,15 @@ def prepare_media_contents(client_instance, prompt_data: dict):
     for i, video_url in enumerate(video_urls):
         try:
             video_metadata = video_metadata_list[i] if i < len(video_metadata_list) else {}
-            video_part = types.Part(
-                file_data=types.FileData(file_url=video_url),
-                video_metadata=types.VideoMetadata(**video_metadata)
-            )
+            if video_metadata:
+                video_part = types.Part(
+                    file_data=types.FileData(file_url=video_url),
+                    video_metadata=types.VideoMetadata(**video_metadata)
+                )
+            else:
+                video_part = types.Part(
+                    file_data=types.FileData(file_url=video_url)
+                )
             video_files.append(video_part)
             logging.debug(f"Added video URL: {video_url}")
         except Exception as e:
@@ -151,10 +156,15 @@ def prepare_media_contents(client_instance, prompt_data: dict):
         try:
             video_mime_type = video_mime_types[i] if i < len(video_mime_types) else 'video/mp4'
             video_metadata = video_metadata_list[i] if i < len(video_metadata_list) else {}
-            video_part = types.Part(
-                inline_data=types.Blob(data=video_bytes, mime_type=video_mime_type),
-                video_metadata=types.VideoMetadata(**video_metadata)
-            )
+            if video_metadata:
+                video_part = types.Part(
+                    inline_data=types.Blob(data=video_bytes, mime_type=video_mime_type),
+                    video_metadata=types.VideoMetadata(**video_metadata)
+                )
+            else:
+                video_part = types.Part(
+                    inline_data=types.Blob(data=video_bytes, mime_type=video_mime_type)
+                )
             video_files.append(video_part)
             logging.debug(f"Added video bytes: {video_mime_type}")
         except Exception as e:
