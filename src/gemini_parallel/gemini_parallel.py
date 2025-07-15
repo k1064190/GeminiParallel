@@ -10,14 +10,14 @@ from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
 from google.api_core import exceptions as google_exceptions
-import dotenv
+from dotenv import load_dotenv
 import queue
 import uuid
 
 # Import media processing utilities
 from .gemini_media_processor import prepare_media_contents
 
-dotenv.load_dotenv()
+load_dotenv()
 
 
 # --- Constants ---
