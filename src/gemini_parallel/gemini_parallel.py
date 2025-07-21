@@ -15,7 +15,12 @@ import queue
 import uuid
 
 # Import media processing utilities
-from .gemini_media_processor import prepare_media_contents
+try:
+    # Try relative import (when run as package)
+    from .gemini_media_processor import prepare_media_contents
+except ImportError:
+    # Try absolute import (when run as script/debugger)
+    from gemini_media_processor import prepare_media_contents  # type: ignore
 
 load_dotenv()
 
@@ -472,7 +477,8 @@ class GeminiParallelProcessor:
     def __init__(self, key_manager: AdvancedApiKeyManager, model_name: str,
                  worker_cooldown_seconds: float = DEFAULT_WORKER_COOLDOWN_SECONDS,
                  api_call_interval: float = 2.0, 
-                 max_workers: int = DEFAULT_MAX_WORKERS):
+                 max_workers: int = DEFAULT_MAX_WORKERS,
+                 return_response: bool = False):
         """
         Initializes the parallel processor with dynamic key allocation and dual cooldown system.
 
@@ -484,13 +490,15 @@ class GeminiParallelProcessor:
             api_call_interval (float): Minimum time (in seconds) to wait between consecutive API calls 
                                       made by ANY worker. Prevents IP ban from too many simultaneous requests.
             max_workers (int): The maximum number of parallel threads to use. Recommended to be less or equal to 4.
+            return_response (bool): Whether to return the full response object instead of just the text.
         """
         self.key_manager = key_manager
         self.model_name = model_name
         self.worker_cooldown_seconds = worker_cooldown_seconds
         self.api_call_interval = api_call_interval
         self.max_workers = max_workers
-        
+        self.return_response = return_response
+
         # Track worker cooldowns individually
         self.worker_last_call_time = {}  # worker_id -> last_call_timestamp
         self.worker_lock = threading.Lock()
@@ -575,7 +583,10 @@ class GeminiParallelProcessor:
                 media_count = sum(1 for content in contents if hasattr(content, 'file_data') or hasattr(content, 'inline_data'))
                 content_type = f"text+{media_count}media" if media_count > 0 else "text-only"
                 logging.debug(f"API call successful ({content_type}). Response length: {len(response_text)}.")
-                return response_text
+                if self.return_response:
+                    return response
+                else:
+                    return response_text
 
             except genai_errors.APIError as e:
                 # Handle different error codes based on official Gemini API documentation
@@ -852,7 +863,7 @@ class GeminiStreamingProcessor:
     """
     def __init__(self, key_manager: AdvancedApiKeyManager, model_name: str,
                  worker_cooldown_seconds: float = DEFAULT_WORKER_COOLDOWN_SECONDS,
-                 api_call_interval: float = 2.0, max_workers: int = DEFAULT_MAX_WORKERS):
+                 api_call_interval: float = 2.0, max_workers: int = DEFAULT_MAX_WORKERS, return_response: bool = False):
         """
         Initialize the streaming processor with dual cooldown system.
         
@@ -862,12 +873,14 @@ class GeminiStreamingProcessor:
             worker_cooldown_seconds (float): Time (in seconds) each worker waits between API calls.
             api_call_interval (float): Minimum time between API calls (global IP ban protection).
             max_workers (int): Maximum number of persistent worker threads.
+            return_response (bool): Whether to return the full response object instead of just the text.
         """
         self.key_manager = key_manager
         self.model_name = model_name
         self.worker_cooldown_seconds = worker_cooldown_seconds
         self.api_call_interval = api_call_interval
         self.max_workers = max_workers
+        self.return_response = return_response
         
         # Track worker cooldowns individually
         self.worker_last_call_time = {}  # worker_id -> last_call_timestamp
@@ -1175,13 +1188,16 @@ class GeminiStreamingProcessor:
                     contents=contents,
                     config=genai.types.GenerateContentConfig(**generation_config)
                 )
-                response_text = response.text.strip()
+                response_text = response.text
                 
                 # Log content types for debugging
                 media_count = sum(1 for content in contents if hasattr(content, 'file_data') or hasattr(content, 'inline_data'))
                 content_type = f"text+{media_count}media" if media_count > 0 else "text-only"
-                logging.debug(f"API call successful ({content_type}). Response length: {len(response_text)}.")
-                return response_text
+                logging.debug(f"API call successful ({content_type})")
+                if self.return_response:
+                    return response
+                else:
+                    return response_text
 
             except genai_errors.APIError as e:
                 # Handle different error codes based on official Gemini API documentation
