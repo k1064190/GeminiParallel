@@ -53,19 +53,21 @@ Perfect for processing large amounts of data at once. All requests are submitted
 from gemini_parallel import AdvancedApiKeyManager, GeminiParallelProcessor
 
 # Initialize the API key manager
-key_manager = AdvancedApiKeyManager([
-    "GEMINI_API_KEY_1",
-    "GEMINI_API_KEY_2", 
-    "GEMINI_API_KEY_3"
-])
+key_manager = AdvancedApiKeyManager(
+    keylist_names=["GEMINI_API_KEY_1", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3"],
+    # Or use "all" to load all GEMINI_API_KEY_* from environment
+    # keylist_names="all",
+    # Or use a number to load GEMINI_API_KEY_1 through GEMINI_API_KEY_N
+    # keylist_names=10,
+)
 
 # Create the batch processor
 processor = GeminiParallelProcessor(
     key_manager=key_manager,
     model_name="gemini-2.0-flash-001",
-    worker_cooldown_seconds=5.0,  # Worker pacing
-    api_call_interval=2.0,        # IP ban protection
-    max_workers=4
+    worker_cooldown_seconds=20,   # Worker pacing (default: 20s)
+    api_call_interval=2.0,         # IP ban protection (default: 2s)
+    max_workers=4                  # Maximum workers (default: 4)
 )
 
 # Prepare your prompts
@@ -99,10 +101,9 @@ Perfect for real-time applications, web services, and interactive systems. Maint
 from gemini_parallel import AdvancedApiKeyManager, GeminiStreamingProcessor
 
 # Initialize the API key manager
-key_manager = AdvancedApiKeyManager([
-    "GEMINI_API_KEY_1",
-    "GEMINI_API_KEY_2"
-])
+key_manager = AdvancedApiKeyManager(
+    keylist_names=["GEMINI_API_KEY_1", "GEMINI_API_KEY_2"]
+)
 
 # Create the streaming processor
 stream_processor = GeminiStreamingProcessor(
@@ -414,12 +415,41 @@ prompt_data = {
 ### AdvancedApiKeyManager Parameters
 
 ```python
+# Basic usage with default settings (all keys are free)
 key_manager = AdvancedApiKeyManager(
     keylist_names=["GEMINI_API_KEY_1", "GEMINI_API_KEY_2"],
-    key_cooldown_seconds=30,           # Cooldown after each key use (default: 30s)
-    exhausted_wait_seconds=120,        # Wait time for temporary exhaustion (default: 120s)
-    fully_exhausted_wait_seconds=43200, # Wait time for full exhaustion (default: 12 hours)
-    max_exhausted_retries=3            # Max retries before marking fully exhausted (default: 3)
+    # Or use "all" to load all GEMINI_API_KEY_* from environment
+    # keylist_names="all",
+    # Or use a number to load GEMINI_API_KEY_1 through GEMINI_API_KEY_N  
+    # keylist_names=10,
+)
+
+# Advanced usage with paid keys (no cooldown)
+key_manager = AdvancedApiKeyManager(
+    keylist_names="all",  # Load all available keys
+    paid_keys=["GEMINI_API_KEY_1", "GEMINI_API_KEY_2"],  # These keys are paid
+    # Or mark all keys as paid:
+    # paid_keys="all",
+)
+
+# Custom settings for free and paid keys
+key_manager = AdvancedApiKeyManager(
+    keylist_names=10,  # Load first 10 keys
+    paid_keys=["GEMINI_API_KEY_1", "GEMINI_API_KEY_2"],
+    key_settings={
+        "free": {
+            "key_cooldown_seconds": 30,        # 30s cooldown for free keys (default)
+            "exhausted_wait_seconds": 120,     # 2 minutes temporary exhaustion (default)
+            "fully_exhausted_wait_seconds": 43200,  # 12 hours full exhaustion (default)
+            "max_exhausted_retries": 3         # 3 retries before full exhaustion (default)
+        },
+        "paid": {
+            "key_cooldown_seconds": 0,         # No cooldown for paid keys (default)
+            "exhausted_wait_seconds": 120,     # 2 minutes temporary exhaustion
+            "fully_exhausted_wait_seconds": 43200,  # 12 hours full exhaustion
+            "max_exhausted_retries": 3         # 3 retries before full exhaustion
+        }
+    }
 )
 ```
 
@@ -430,17 +460,18 @@ key_manager = AdvancedApiKeyManager(
 processor = GeminiParallelProcessor(
     key_manager=key_manager,
     model_name="gemini-2.0-flash-001",      # Gemini model to use
-    worker_cooldown_seconds=5.0,            # Worker cooldown between API calls (default: 5s)
+    worker_cooldown_seconds=20,             # Worker cooldown between API calls (default: 20s)
     api_call_interval=2.0,                  # Global interval between ANY API calls (default: 2s)
-    max_workers=4                           # Maximum concurrent workers
+    max_workers=4                           # Maximum concurrent workers (default: 4)
 )
 
-# Streaming Processor (same parameters except no worker_cooldown_seconds)
+# Streaming Processor
 stream_processor = GeminiStreamingProcessor(
     key_manager=key_manager,
     model_name="gemini-2.0-flash-001",
-    api_call_interval=2.0,                  # Global interval to prevent IP ban
-    max_workers=4
+    worker_cooldown_seconds=20,             # Worker cooldown between API calls (default: 20s)
+    api_call_interval=2.0,                  # Global interval to prevent IP ban (default: 2s)
+    max_workers=4                           # Maximum concurrent workers (default: 4)
 )
 ```
 
@@ -464,12 +495,70 @@ prompt_data = {
 # Works with both processors
 ```
 
+## Key Categories: Free vs Paid Keys
+
+The library supports two categories of API keys with different behaviors:
+
+### Free Keys
+- Have cooldown periods after each use (default: 30 seconds)
+- Suitable for free-tier API keys with rate limits
+- Cost-effective for non-urgent tasks
+
+### Paid Keys  
+- Can have zero cooldown (immediate reuse)
+- Suitable for paid API keys with higher quotas
+- Optimal for real-time applications
+
+### Example: Mixed Free and Paid Keys
+
+```python
+# Some keys are paid (no cooldown), others are free
+key_manager = AdvancedApiKeyManager(
+    keylist_names="all",  # Load all available keys
+    paid_keys=["GEMINI_API_KEY_1", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3"],
+    key_settings={
+        "free": {
+            "key_cooldown_seconds": 30,  # 30s cooldown for free keys
+        },
+        "paid": {
+            "key_cooldown_seconds": 0,   # No cooldown for paid keys!
+        }
+    }
+)
+
+# Paid keys will be reused immediately for maximum throughput
+processor = GeminiParallelProcessor(
+    key_manager=key_manager,
+    model_name="gemini-2.0-flash-001",
+    worker_cooldown_seconds=5,  # Workers can work faster with paid keys
+    max_workers=4
+)
+```
+
+### Example: All Paid Keys for Maximum Performance
+
+```python
+# Mark all keys as paid for maximum throughput
+key_manager = AdvancedApiKeyManager(
+    keylist_names="all",
+    paid_keys="all",  # All keys are paid
+    key_settings={
+        "paid": {
+            "key_cooldown_seconds": 0,  # No cooldown at all
+            "exhausted_wait_seconds": 30,  # Shorter wait on exhaustion
+        }
+    }
+)
+
+# This configuration allows for maximum request throughput
+```
+
 ## API Key Management States
 
 The system manages API keys through several states:
 
 - **AVAILABLE**: Key is ready to use
-- **COOLDOWN**: Key is in cooldown period after recent use
+- **COOLDOWN**: Key is in cooldown period after recent use (only for free keys if configured)
 - **TEMPORARILY_EXHAUSTED**: Key hit rate limits, temporary wait
 - **FULLY_EXHAUSTED**: Key exceeded retry limits, long wait period
 - **FAILED_INIT**: Key failed initialization, won't be used
@@ -480,7 +569,7 @@ The system manages API keys through several states:
 # Get current status of all keys
 status_summary = key_manager.get_keys_status_summary()
 for key_id, status_info in status_summary.items():
-    print(f"Key {key_id}: {status_info['status']} "
+    print(f"Key {key_id}: {status_info['category']} - {status_info['status']} "
           f"(exhausted: {status_info['exhausted_count']})")
 
 # For streaming processor, also check worker status

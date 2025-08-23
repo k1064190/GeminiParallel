@@ -33,21 +33,10 @@ ALL_KEYS_WAITING_MARKER = "ALL_KEYS_WAITING"
 
 # Key status markers for the manager
 KEY_STATUS_AVAILABLE = "AVAILABLE"
-KEY_STATUS_COOLDOWN = "COOLDOWN"  # New status: cooling down after use
-KEY_STATUS_TEMPORARILY_EXHAUSTED = "TEMPORARILY_EXHAUSTED"  # New status: temporarily exhausted
-KEY_STATUS_FULLY_EXHAUSTED = "FULLY_EXHAUSTED"  # New status: fully exhausted
+KEY_STATUS_COOLDOWN = "COOLDOWN"  # Status: cooling down after use
+KEY_STATUS_TEMPORARILY_EXHAUSTED = "TEMPORARILY_EXHAUSTED"  # Status: temporarily exhausted
+KEY_STATUS_FULLY_EXHAUSTED = "FULLY_EXHAUSTED"  # Status: fully exhausted
 KEY_STATUS_FAILED_INIT = "FAILED_INIT"
-
-# Default configuration for the parallel processor
-DEFAULT_MAX_WORKERS = 4
-DEFAULT_WORKER_WAIT_DELAY = 10 # How long workers wait when all keys are exhausted or waiting
-DEFAULT_API_CALL_RETRIES = 3 # Retries for non-exhaustion errors within a single API call attempt
-DEFAULT_KEY_COOLDOWN_SECONDS = 30  # Cooldown time after key usage (30 seconds)
-DEFAULT_WORKER_COOLDOWN_SECONDS = 20  # Cooldown time for worker between API calls (20 seconds)
-DEFAULT_KEY_EXHAUSTED_WAIT_SECONDS = 120  # Wait time for temporary exhaustion (120 seconds)
-DEFAULT_KEY_FULLY_EXHAUSTED_WAIT_SECONDS = 12 * 3600  # Wait time for full exhaustion (12 hours)
-DEFAULT_MAX_EXHAUSTED_RETRIES = 3  # Maximum retry count before becoming fully exhausted
-DEFAULT_ERROR_RETRY_DELAY = 30 # Delay between error retries (30 seconds)
 
 # Configure logging for the module
 logging.basicConfig(
@@ -62,10 +51,8 @@ class AdvancedApiKeyManager:
     staged exhausted states, and time-based recovery.
     """
     def __init__(self, keylist_names, 
-                 key_cooldown_seconds=DEFAULT_KEY_COOLDOWN_SECONDS,
-                 exhausted_wait_seconds=DEFAULT_KEY_EXHAUSTED_WAIT_SECONDS,
-                 fully_exhausted_wait_seconds=DEFAULT_KEY_FULLY_EXHAUSTED_WAIT_SECONDS,
-                 max_exhausted_retries=DEFAULT_MAX_EXHAUSTED_RETRIES):
+                 paid_keys=None,
+                 key_settings=None):
         """
         Initialize the advanced API key manager.
 
@@ -75,23 +62,71 @@ class AdvancedApiKeyManager:
                 - "all": Find all GEMINI_API_KEY_* environment variables
                 - Integer (e.g., 5): Search for GEMINI_API_KEY_1, GEMINI_API_KEY_2, ..., GEMINI_API_KEY_5
                 - Single string: Use as single environment variable name
-            key_cooldown_seconds (int): Cooldown time after key usage (seconds)
-            exhausted_wait_seconds (int): Wait time for temporary exhaustion (seconds)
-            fully_exhausted_wait_seconds (int): Wait time for full exhaustion (seconds)
-            max_exhausted_retries (int): Maximum retry count before becoming fully exhausted
+            paid_keys (str | list[str] | None): 
+                - "all": All keys are paid
+                - List of strings: Environment variable names of paid keys (e.g., ["GEMINI_API_KEY_1", "GEMINI_API_KEY_3"])
+                - None: All keys are free (default behavior)
+            key_settings (dict | None): Settings for each key category
+                Example: {
+                    "free": {
+                        "key_cooldown_seconds": 30,
+                        "exhausted_wait_seconds": 120,
+                        "fully_exhausted_wait_seconds": 43200,
+                        "max_exhausted_retries": 3
+                    },
+                    "paid": {
+                        "key_cooldown_seconds": 0,
+                        "exhausted_wait_seconds": 60,
+                        "fully_exhausted_wait_seconds": 3600,
+                        "max_exhausted_retries": 5
+                    }
+                }
+                If not provided, default settings will be used.
         """
-        self.key_cooldown_seconds = key_cooldown_seconds
-        self.exhausted_wait_seconds = exhausted_wait_seconds
-        self.fully_exhausted_wait_seconds = fully_exhausted_wait_seconds
-        self.max_exhausted_retries = max_exhausted_retries
+        self.paid_keys = paid_keys
         
-        self.api_keys = self._load_keys(keylist_names)
+        # Default settings for each category
+        default_free_settings = {
+            "key_cooldown_seconds": 30,  # 30 seconds cooldown
+            "exhausted_wait_seconds": 120,  # 2 minutes temporary exhaustion
+            "fully_exhausted_wait_seconds": 43200,  # 12 hours full exhaustion
+            "max_exhausted_retries": 3  # 3 retries before full exhaustion
+        }
+        
+        default_paid_settings = {
+            "key_cooldown_seconds": 0,  # No cooldown for paid keys by default
+            "exhausted_wait_seconds": 120,  # 2 minutes temporary exhaustion
+            "fully_exhausted_wait_seconds": 43200,  # 12 hours full exhaustion
+            "max_exhausted_retries": 3  # 3 retries before full exhaustion
+        }
+        
+        # Parse key_settings or use defaults
+        if key_settings is None:
+            self.category_settings = {
+                "free": default_free_settings,
+                "paid": default_paid_settings
+            }
+        else:
+            self.category_settings = {
+                "free": {**default_free_settings, **key_settings.get("free", {})},
+                "paid": {**default_paid_settings, **key_settings.get("paid", {})}
+            }
+        
+        # Load keys with their environment variable names
+        self.api_keys, self.key_to_env_name = self._load_keys_with_names(keylist_names)
         if not self.api_keys:
             raise ValueError("No valid API keys found from provided environment variables.")
+
+        # Determine which keys are paid
+        paid_key_set = self._determine_paid_keys(paid_keys)
 
         # Track detailed information for each key
         self.key_info = {}
         for key in self.api_keys:
+            # Check if this key is paid based on its environment variable name
+            env_name = self.key_to_env_name.get(key, "")
+            is_paid = key in paid_key_set
+            
             self.key_info[key] = {
                 'status': KEY_STATUS_AVAILABLE,
                 'last_used_time': 0,  # Last usage time
@@ -99,6 +134,8 @@ class AdvancedApiKeyManager:
                 'exhausted_count': 0,  # Consecutive exhausted count
                 'total_exhausted_count': 0,  # Total exhausted count
                 'assigned_worker': None,  # Which worker is using this key
+                'category': 'paid' if is_paid else 'free',  # Key category
+                'env_name': env_name,  # Environment variable name for debugging
             }
         
         self.num_keys = len(self.api_keys)
@@ -109,10 +146,119 @@ class AdvancedApiKeyManager:
         
         self._lock = threading.Lock()
 
-        logging.info(f"AdvancedApiKeyManager initialized with {self.num_keys} keys.")
-        logging.info(f"Settings - Cooldown: {self.key_cooldown_seconds}s, "
-                    f"Exhausted wait: {self.exhausted_wait_seconds}s, "
-                    f"Fully exhausted wait: {self.fully_exhausted_wait_seconds}s")
+        # Count free and paid keys
+        free_count = sum(1 for info in self.key_info.values() if info['category'] == 'free')
+        paid_count = sum(1 for info in self.key_info.values() if info['category'] == 'paid')
+        
+        logging.info(f"AdvancedApiKeyManager initialized with {self.num_keys} keys (Free: {free_count}, Paid: {paid_count}).")
+        
+        # Log settings for each category
+        for category, settings in self.category_settings.items():
+            if (category == "free" and free_count > 0) or (category == "paid" and paid_count > 0):
+                logging.info(f"{category.capitalize()} key settings: "
+                            f"Cooldown: {settings['key_cooldown_seconds']}s, "
+                            f"Exhausted wait: {settings['exhausted_wait_seconds']}s, "
+                            f"Fully exhausted wait: {settings['fully_exhausted_wait_seconds']}s, "
+                            f"Max retries: {settings['max_exhausted_retries']}")
+
+    def _determine_paid_keys(self, paid_keys):
+        """
+        Determine which API keys are paid based on the paid_keys parameter.
+        
+        Args:
+            paid_keys (str | list[str] | None): 
+                - "all": All keys are paid
+                - List of strings: Environment variable names of paid keys
+                - None: No paid keys
+                
+        Returns:
+            set: Set of API keys that are paid
+        """
+        paid_key_set = set()
+        
+        if paid_keys is None:
+            # All keys are free
+            logging.info("All keys are configured as free (with cooldown).")
+            return paid_key_set
+        
+        if paid_keys == "all":
+            # All keys are paid
+            paid_key_set = set(self.api_keys)
+            logging.info("All keys are configured as paid (no cooldown).")
+            return paid_key_set
+        
+        if isinstance(paid_keys, list):
+            # Specific keys are paid based on environment variable names
+            for env_name in paid_keys:
+                # Find the key associated with this environment variable name
+                for key, key_env_name in self.key_to_env_name.items():
+                    if key_env_name == env_name:
+                        paid_key_set.add(key)
+                        logging.debug(f"Key from '{env_name}' configured as paid.")
+                        break
+                else:
+                    logging.warning(f"Environment variable '{env_name}' specified in paid_keys not found in loaded keys.")
+            
+            logging.info(f"Configured {len(paid_key_set)} keys as paid (no cooldown).")
+        
+        return paid_key_set
+
+    def _load_keys_with_names(self, keylist_names):
+        """
+        Load API keys from environment variables and track their names.
+        
+        Returns:
+            tuple: (list of API keys, dict mapping key to env variable name)
+        """
+        keys = []
+        key_to_env_name = {}
+        
+        # Handle special cases
+        if keylist_names == "all":
+            # Search for all GEMINI_API_KEY* environment variables
+            logging.info("Searching for all GEMINI_API_KEY_* environment variables...")
+            for env_var, value in os.environ.items():
+                if env_var.startswith("GEMINI_API_KEY") and value and len(value) > 10:
+                    keys.append(value)
+                    key_to_env_name[value] = env_var
+                    logging.debug(f"Found API key from environment variable '{env_var}'.")
+        elif isinstance(keylist_names, (int, str)) and str(keylist_names).isdigit():
+            # Handle numeric input: search GEMINI_API_KEY_1, GEMINI_API_KEY_2, ..., GEMINI_API_KEY_n
+            num_keys = int(keylist_names)
+            logging.info(f"Searching for keys GEMINI_API_KEY_1 through GEMINI_API_KEY_{num_keys}...")
+            for i in range(1, num_keys + 1):
+                key_name = f"GEMINI_API_KEY_{i}"
+                key = os.getenv(key_name)
+                if key and len(key) > 10:
+                    keys.append(key)
+                    key_to_env_name[key] = key_name
+                    logging.debug(f"Loaded key from {key_name}.")
+                else:
+                    logging.debug(f"Environment variable '{key_name}' not found or invalid.")
+        elif isinstance(keylist_names, list):
+            # Handle list of key names (original behavior)
+            for key_name in keylist_names:
+                key = os.getenv(key_name)
+                if key and len(key) > 10:
+                    keys.append(key)
+                    key_to_env_name[key] = key_name
+                    logging.debug(f"Loaded key from {key_name}.")
+                else:
+                    logging.warning(f"Environment variable '{key_name}' not found or invalid.")
+        else:
+            # Handle single key name
+            key_names = [keylist_names] if isinstance(keylist_names, str) else keylist_names
+            for key_name in key_names:
+                key = os.getenv(key_name)
+                if key and len(key) > 10:
+                    keys.append(key)
+                    key_to_env_name[key] = key_name
+                    logging.debug(f"Loaded key from {key_name}.")
+                else:
+                    logging.warning(f"Environment variable '{key_name}' not found or invalid.")
+        
+        logging.info(f"Successfully loaded {len(keys)} valid API keys.")
+        return keys, key_to_env_name
 
     def _load_keys(self, keylist_names):
         """
@@ -174,24 +320,27 @@ class AdvancedApiKeyManager:
         current_time = time.time()
         
         for key, info in self.key_info.items():
+            category = info['category']
+            settings = self.category_settings[category]
+            
             if info['status'] == KEY_STATUS_COOLDOWN:
-                # Check if cooldown time has passed
-                if current_time - info['status_change_time'] >= self.key_cooldown_seconds:
+                # Check if cooldown time has passed based on category settings
+                if current_time - info['status_change_time'] >= settings['key_cooldown_seconds']:
                     info['status'] = KEY_STATUS_AVAILABLE
-                    logging.debug(f"Key ...{key[-4:]} cooldown finished, now AVAILABLE")
+                    logging.debug(f"{category.capitalize()} key ...{key[-4:]} cooldown finished, now AVAILABLE")
             
             elif info['status'] == KEY_STATUS_TEMPORARILY_EXHAUSTED:
-                # Check if temporary exhaustion time has passed
-                if current_time - info['status_change_time'] >= self.exhausted_wait_seconds:
+                # Check if temporary exhaustion time has passed based on category settings
+                if current_time - info['status_change_time'] >= settings['exhausted_wait_seconds']:
                     info['status'] = KEY_STATUS_AVAILABLE
-                    logging.info(f"Key ...{key[-4:]} temporary exhaustion recovered, now AVAILABLE")
+                    logging.info(f"{category.capitalize()} key ...{key[-4:]} temporary exhaustion recovered, now AVAILABLE")
             
             elif info['status'] == KEY_STATUS_FULLY_EXHAUSTED:
-                # Check if full exhaustion time has passed
-                if current_time - info['status_change_time'] >= self.fully_exhausted_wait_seconds:
+                # Check if full exhaustion time has passed based on category settings
+                if current_time - info['status_change_time'] >= settings['fully_exhausted_wait_seconds']:
                     info['status'] = KEY_STATUS_AVAILABLE
                     info['exhausted_count'] = 0  # Reset count
-                    logging.info(f"Key ...{key[-4:]} full exhaustion recovered, now AVAILABLE")
+                    logging.info(f"{category.capitalize()} key ...{key[-4:]} full exhaustion recovered, now AVAILABLE")
 
     def assign_key_to_worker(self, worker_id: str):
         """
@@ -312,7 +461,7 @@ class AdvancedApiKeyManager:
 
     def mark_key_used(self, api_key: str):
         """
-        Mark a key as just used (put it in cooldown).
+        Mark a key as just used (put it in cooldown based on its category).
         
         Args:
             api_key (str): The API key that was used
@@ -323,16 +472,25 @@ class AdvancedApiKeyManager:
                 return
             
             info = self.key_info[api_key]
-            info['last_used_time'] = time.time()
-            info['status'] = KEY_STATUS_COOLDOWN
-            info['status_change_time'] = time.time()
+            category = info['category']
+            cooldown_seconds = self.category_settings[category]['key_cooldown_seconds']
             
-            logging.debug(f"Key ...{api_key[-4:]} marked as used, now in COOLDOWN for {self.key_cooldown_seconds}s")
+            info['last_used_time'] = time.time()
+            
+            # Only put in cooldown if cooldown_seconds > 0
+            if cooldown_seconds > 0:
+                info['status'] = KEY_STATUS_COOLDOWN
+                info['status_change_time'] = time.time()
+                logging.debug(f"{category.capitalize()} key ...{api_key[-4:]} marked as used, now in COOLDOWN for {cooldown_seconds}s")
+            else:
+                # No cooldown for this category (e.g., paid keys with 0 cooldown)
+                info['status'] = KEY_STATUS_AVAILABLE
+                logging.debug(f"{category.capitalize()} key ...{api_key[-4:]} marked as used, no cooldown (immediately available)")
 
     def mark_key_exhausted(self, api_key):
         """
         Mark key as exhausted.
-        Classify as temporary or full exhaustion based on consecutive exhausted count.
+        Classify as temporary or full exhaustion based on consecutive exhausted count and category settings.
         """
         with self._lock:
             if api_key not in self.key_info:
@@ -340,28 +498,31 @@ class AdvancedApiKeyManager:
                 return
             
             info = self.key_info[api_key]
+            category = info['category']
+            settings = self.category_settings[category]
+            
             info['exhausted_count'] += 1
             info['total_exhausted_count'] += 1
             current_time = time.time()
             
             masked_key = f"...{api_key[-4:]}" if len(api_key) > 4 else "invalid key"
             
-            if info['exhausted_count'] >= self.max_exhausted_retries:
+            if info['exhausted_count'] >= settings['max_exhausted_retries']:
                 # Change to fully exhausted status
                 info['status'] = KEY_STATUS_FULLY_EXHAUSTED
                 info['status_change_time'] = current_time
-                wait_hours = self.fully_exhausted_wait_seconds / 3600
+                wait_hours = settings['fully_exhausted_wait_seconds'] / 3600
                 logging.warning(
-                    f"Key {masked_key} marked as FULLY_EXHAUSTED "
+                    f"{category.capitalize()} key {masked_key} marked as FULLY_EXHAUSTED "
                     f"(count: {info['exhausted_count']}) - waiting {wait_hours:.1f}h"
                 )
             else:
                 # Change to temporarily exhausted status
                 info['status'] = KEY_STATUS_TEMPORARILY_EXHAUSTED
                 info['status_change_time'] = current_time
-                wait_minutes = self.exhausted_wait_seconds / 60
+                wait_minutes = settings['exhausted_wait_seconds'] / 60
                 logging.warning(
-                    f"Key {masked_key} marked as TEMPORARILY_EXHAUSTED "
+                    f"{category.capitalize()} key {masked_key} marked as TEMPORARILY_EXHAUSTED "
                     f"(count: {info['exhausted_count']}) - waiting {wait_minutes:.1f}m"
                 )
 
@@ -399,6 +560,7 @@ class AdvancedApiKeyManager:
                 masked_key = f"...{key[-4:]}"
                 summary[masked_key] = {
                     'status': info['status'],
+                    'category': info['category'],
                     'exhausted_count': info['exhausted_count'],
                     'total_exhausted_count': info['total_exhausted_count'],
                     'assigned_worker': info['assigned_worker']
@@ -475,9 +637,9 @@ class GeminiParallelProcessor:
     It handles API key rotation, resource exhaustion retries, and general API errors.
     """
     def __init__(self, key_manager: AdvancedApiKeyManager, model_name: str,
-                 worker_cooldown_seconds: float = DEFAULT_WORKER_COOLDOWN_SECONDS,
+                 worker_cooldown_seconds: float = 20,  # 20 seconds worker cooldown
                  api_call_interval: float = 2.0, 
-                 max_workers: int = DEFAULT_MAX_WORKERS,
+                 max_workers: int = 4,  # 4 workers by default
                  return_response: bool = False):
         """
         Initializes the parallel processor with dynamic key allocation and dual cooldown system.
@@ -554,8 +716,8 @@ class GeminiParallelProcessor:
         
         # Perform API call with retries
         retries = 0
-        wait_time = DEFAULT_ERROR_RETRY_DELAY
-        while retries < DEFAULT_API_CALL_RETRIES:
+        wait_time = 30  # Initial retry delay in seconds
+        while retries < 3:  # Maximum 3 retries for API call errors
             response = None
             try:
                 # Global API call interval control - prevents IP ban from simultaneous requests
@@ -609,13 +771,13 @@ class GeminiParallelProcessor:
                     # 504: DEADLINE_EXCEEDED - Service couldn't complete in time
                     logging.warning(
                         f"Retryable server error ({error_code}): {e}. "
-                        f"Retry {retries + 1}/{DEFAULT_API_CALL_RETRIES}..."
+                        f"Retry {retries + 1}/3..."
                     )
                 else:
                     # Unknown error code - treat as retryable
                     logging.warning(
                         f"Unknown APIError ({error_code}): {e}. "
-                        f"Retry {retries + 1}/{DEFAULT_API_CALL_RETRIES}..."
+                        f"Retry {retries + 1}/3..."
                     )
             except Exception as e:
                 logging.error(
@@ -625,13 +787,13 @@ class GeminiParallelProcessor:
                 )
 
             retries += 1
-            if retries < DEFAULT_API_CALL_RETRIES:
+            if retries < 3:
                 logging.info(f"Waiting {wait_time}s before retrying API call...")
                 time.sleep(wait_time)
                 wait_time = wait_time * 2**retries # Exponential backoff
             else:
                 logging.error(
-                    f"Failed API call after {DEFAULT_API_CALL_RETRIES} retries."
+                    f"Failed API call after 3 retries."
                 )
                 return PERSISTENT_ERROR_MARKER
 
@@ -684,7 +846,7 @@ class GeminiParallelProcessor:
             if current_api_key == ALL_KEYS_WAITING_MARKER:
                 # All keys are busy, wait and retry
                 logging.debug(f"Worker {worker_id} waiting - all keys busy")
-                time.sleep(DEFAULT_WORKER_WAIT_DELAY)
+                time.sleep(10)  # Wait 10 seconds when all keys are busy
                 attempt_count += 1
                 continue
             elif current_api_key is None:
@@ -862,8 +1024,10 @@ class GeminiStreamingProcessor:
         processor.stop()  # Stop workers when done
     """
     def __init__(self, key_manager: AdvancedApiKeyManager, model_name: str,
-                 worker_cooldown_seconds: float = DEFAULT_WORKER_COOLDOWN_SECONDS,
-                 api_call_interval: float = 2.0, max_workers: int = DEFAULT_MAX_WORKERS, return_response: bool = False):
+                 worker_cooldown_seconds: float = 20,  # 20 seconds worker cooldown
+                 api_call_interval: float = 2.0, 
+                 max_workers: int = 4,  # 4 workers by default
+                 return_response: bool = False):
         """
         Initialize the streaming processor with dual cooldown system.
         
@@ -1104,7 +1268,7 @@ class GeminiStreamingProcessor:
             if current_api_key == ALL_KEYS_WAITING_MARKER:
                 # All keys are busy, wait and retry
                 logging.debug(f"Worker {worker_id} waiting - all keys busy")
-                time.sleep(DEFAULT_WORKER_WAIT_DELAY)
+                time.sleep(10)  # Wait 10 seconds when all keys are busy
                 attempt_count += 1
                 continue
             elif current_api_key is None:
@@ -1165,8 +1329,8 @@ class GeminiStreamingProcessor:
         
         # Perform API call with retries
         retries = 0
-        wait_time = DEFAULT_ERROR_RETRY_DELAY
-        while retries < DEFAULT_API_CALL_RETRIES:
+        wait_time = 30  # Initial retry delay in seconds
+        while retries < 3:  # Maximum 3 retries for API call errors
             response = None
             try:
                 # Global API call interval control - prevents IP ban from simultaneous requests
@@ -1220,13 +1384,13 @@ class GeminiStreamingProcessor:
                     # 504: DEADLINE_EXCEEDED - Service couldn't complete in time
                     logging.warning(
                         f"Retryable server error ({error_code}): {e}. "
-                        f"Retry {retries + 1}/{DEFAULT_API_CALL_RETRIES}..."
+                        f"Retry {retries + 1}/3..."
                     )
                 else:
                     # Unknown error code - treat as retryable
                     logging.warning(
                         f"Unknown APIError ({error_code}): {e}. "
-                        f"Retry {retries + 1}/{DEFAULT_API_CALL_RETRIES}..."
+                        f"Retry {retries + 1}/3..."
                     )
             except Exception as e:
                 logging.error(
@@ -1236,13 +1400,13 @@ class GeminiStreamingProcessor:
                 )
 
             retries += 1
-            if retries < DEFAULT_API_CALL_RETRIES:
+            if retries < 3:
                 logging.info(f"Waiting {wait_time}s before retrying API call...")
                 time.sleep(wait_time)
                 wait_time = wait_time * 2**retries # Exponential backoff
             else:
                 logging.error(
-                    f"Failed API call after {DEFAULT_API_CALL_RETRIES} retries."
+                    f"Failed API call after 3 retries."
                 )
                 return PERSISTENT_ERROR_MARKER
 
