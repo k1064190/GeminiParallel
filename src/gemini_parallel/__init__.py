@@ -6,10 +6,20 @@ from .gemini_parallel import (
     AdvancedApiKeyManager,
 )
 from .gemini_media_processor import prepare_media_contents
+from .gemini_tts import (
+    GeminiTTSProcessor,
+    text_to_speech,
+    TTS_VOICES,
+    TTS_MODELS,
+)
 
 __all__ = [
     "GeminiParallelProcessor",
     "GeminiStreamingProcessor",
     "AdvancedApiKeyManager",
     "prepare_media_contents",
+    "GeminiTTSProcessor",
+    "text_to_speech",
+    "TTS_VOICES",
+    "TTS_MODELS",
 ]

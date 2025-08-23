@@ -10,6 +10,7 @@ A robust Python library for making parallel API calls to Google's Gemini AI mode
 - **Multi-Modal Support**: Process text, audio, and video inputs with flexible positioning using `<audio>` and `<video>` tokens
 - **Multiple Media Files**: Support for multiple audio/video files per prompt with precise positioning control
 - **Flexible Input Methods**: Support file paths, raw bytes, and URLs for media content
+- **Text-to-Speech (TTS)**: Generate high-quality speech from text with single and multi-speaker support
 - **Resilient Error Handling**: Automatic retries, exponential backoff, and graceful degradation
 - **Resource Management**: Smart handling of rate limits and quota exhaustion
 - **Comprehensive Logging**: Detailed logging for monitoring and debugging
@@ -637,6 +638,218 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+```
+
+## Text-to-Speech (TTS) Generation
+
+The library includes powerful TTS capabilities using Gemini's native text-to-speech models, supporting single-speaker and multi-speaker audio generation with fine-grained style control. TTS uses the same `AdvancedApiKeyManager` for intelligent key rotation and exhaustion handling.
+
+### Basic TTS Usage
+
+```python
+from gemini_parallel import GeminiTTSProcessor, text_to_speech, AdvancedApiKeyManager
+
+# Quick one-liner TTS (uses default key management)
+audio = text_to_speech(
+    "Hello, world!", 
+    voice="Kore",
+    output_file="hello.wav"
+)
+
+# Using TTS Processor with custom key manager
+key_manager = AdvancedApiKeyManager(
+    keylist_names="all",  # Use all available keys
+    key_settings={
+        "free": {"key_cooldown_seconds": 10}
+    }
+)
+
+tts = GeminiTTSProcessor(
+    key_manager=key_manager,  # Uses dynamic key allocation
+    model="flash",  # or "pro" for higher quality
+    default_voice="Kore"
+)
+
+# Generate speech with style control
+audio = tts.generate_speech(
+    text="Welcome to our presentation!",
+    voice="Puck",  # Upbeat voice
+    style_prompt="Say this with excitement and energy",
+    output_file="welcome.wav"
+)
+```
+
+### Multi-Speaker Dialogue
+
+Generate conversations with up to 2 different speakers:
+
+```python
+# Podcast-style dialogue
+dialogue = [
+    ("Host", "Welcome to Tech Talk podcast!"),
+    ("Guest", "Thanks for having me!"),
+    ("Host", "Let's discuss AI advancements."),
+    ("Guest", "I'm excited to share my insights!")
+]
+
+audio = tts.generate_multi_speaker_dialogue(
+    dialogue=dialogue,
+    voices={
+        "Host": "Charon",    # Informative voice
+        "Guest": "Fenrir"    # Excitable voice
+    },
+    style_prompt="Make Host sound professional and Guest enthusiastic",
+    output_file="podcast.wav"
+)
+```
+
+### Available Voices (30 Options)
+
+The TTS system offers 30 different voice options with various characteristics:
+
+- **Bright/Upbeat**: Zephyr, Puck, Autonoe, Laomedeia
+- **Firm/Clear**: Kore, Orus, Alnilam, Erinome, Iapetus
+- **Informative**: Charon, Rasalgethi, Sadaltager
+- **Smooth/Soft**: Algieba, Despina, Achernar
+- **Casual/Easy-going**: Callirrhoe, Umbriel, Zubenelgenubi
+- **Special Styles**: Fenrir (Excitable), Leda (Youthful), Enceladus (Breathy), Algenib (Gravelly), Gacrux (Mature)
+
+```python
+# List all available voices
+from gemini_parallel import TTS_VOICES
+for voice, style in TTS_VOICES.items():
+    print(f"{voice}: {style}")
+
+# Or use the processor
+voices = tts.list_voices(style="Bright")  # Filter by style
+```
+
+### Generate Content Then Convert to Speech
+
+Combine text generation with TTS:
+
+```python
+# Generate a story and convert to speech
+audio = tts.generate_from_prompt(
+    model="gemini-2.0-flash",
+    prompt="Write a short mysterious story about a magical library (2-3 sentences)",
+    voice="Enceladus",  # Breathy voice for mystery
+    output_file="story.wav"
+)
+```
+
+### Batch TTS Processing
+
+Process multiple texts in parallel:
+
+```python
+texts = [
+    {
+        'text': 'Chapter 1: The Beginning',
+        'voice': 'Schedar',
+        'output_file': 'chapter1.wav',
+        'metadata': {'chapter': 1}
+    },
+    {
+        'text': 'It was a dark and stormy night.',
+        'voice': 'Algenib',
+        'style_prompt': 'Say dramatically',
+        'output_file': 'paragraph1.wav',
+        'metadata': {'paragraph': 1}
+    }
+]
+
+results = tts.batch_generate_speech(texts, max_workers=4)
+
+for metadata, audio, error in results:
+    if audio:
+        print(f"Generated chapter {metadata['chapter']}: {len(audio)} bytes")
+    else:
+        print(f"Failed: {error}")
+```
+
+### TTS with Advanced Key Management
+
+The TTS processor uses the same dynamic key allocation strategy as the streaming processor, automatically handling key exhaustion and rotation:
+
+```python
+# Configure key manager with paid and free keys for TTS
+key_manager = AdvancedApiKeyManager(
+    keylist_names="all",  # Load all available keys
+    paid_keys=["GEMINI_API_KEY_1", "GEMINI_API_KEY_2"],  # Mark some as paid
+    key_settings={
+        "free": {
+            "key_cooldown_seconds": 30,  # Free keys need cooldown
+            "exhausted_wait_seconds": 120
+        },
+        "paid": {
+            "key_cooldown_seconds": 0,  # Paid keys can be reused immediately
+            "exhausted_wait_seconds": 60
+        }
+    }
+)
+
+tts = GeminiTTSProcessor(
+    key_manager=key_manager,
+    model="flash"
+)
+
+# The TTS processor will:
+# 1. Automatically retry with different keys if one is exhausted
+# 2. Use paid keys more frequently (no cooldown)
+# 3. Track and recover from exhaustion states
+# 4. Handle all key management transparently
+```
+
+### Supported Languages
+
+The TTS system automatically detects input language and supports 24 languages including:
+- English, Spanish, French, German, Italian, Portuguese
+- Japanese, Korean, Chinese (Mandarin)
+- Hindi, Bengali, Tamil, Telugu, Marathi
+- Arabic, Russian, Turkish, Thai, Vietnamese
+- Dutch, Polish, Romanian, Ukrainian, Indonesian
+
+### TTS Configuration
+
+```python
+tts = GeminiTTSProcessor(
+    key_manager=key_manager,     # Optional: Uses AdvancedApiKeyManager
+    model="flash",               # "flash" or "pro" 
+    default_voice="Kore",        # Default voice to use
+    output_sample_rate=24000,    # Audio sample rate (24kHz default)
+    output_channels=1,           # Mono (1) or Stereo (2)
+    output_sample_width=2        # 16-bit audio (2 bytes)
+)
+
+# If key_manager is not provided, it will automatically:
+# 1. Look for GEMINI_API_KEY environment variable
+# 2. Or search for all GEMINI_API_KEY_* variables
+# 3. Create a default key manager with found keys
+```
+
+### TTS Error Handling and Retry Logic
+
+The TTS processor includes robust error handling similar to the streaming processor:
+
+```python
+# The TTS processor automatically handles:
+# - API key exhaustion (429 errors) - switches to another key
+# - Temporary failures - retries with exponential backoff
+# - Network issues - automatic retry with different keys
+# - Key initialization failures - marks key as failed and tries another
+
+# Example with error handling
+audio = tts.generate_speech(
+    text="Important announcement",
+    voice="Charon"
+)
+
+if audio:
+    print(f"Success: Generated {len(audio)} bytes")
+else:
+    # The processor already tried all available keys
+    print("Failed after exhausting all retry attempts")
 ```
 
 ## Common Issues
