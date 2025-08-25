@@ -680,6 +680,7 @@ class GeminiParallelProcessor:
                  worker_cooldown_seconds: float = 20,  # 20 seconds worker cooldown
                  api_call_interval: float = 2.0, 
                  max_workers: int = 4,  # 4 workers by default
+                 api_call_retries: int = 3,  # 3 retries by default
                  return_response: bool = False):
         """
         Initializes the parallel processor with dynamic key allocation and dual cooldown system.
@@ -692,6 +693,7 @@ class GeminiParallelProcessor:
             api_call_interval (float): Minimum time (in seconds) to wait between consecutive API calls 
                                       made by ANY worker. Prevents IP ban from too many simultaneous requests.
             max_workers (int): The maximum number of parallel threads to use. Recommended to be less or equal to 4.
+            api_call_retries (int): Maximum number of retries for API call errors (default: 3).
             return_response (bool): Whether to return the full response object instead of just the text.
         """
         self.key_manager = key_manager
@@ -699,6 +701,7 @@ class GeminiParallelProcessor:
         self.worker_cooldown_seconds = worker_cooldown_seconds
         self.api_call_interval = api_call_interval
         self.max_workers = max_workers
+        self.api_call_retries = api_call_retries
         self.return_response = return_response
 
         # Track worker cooldowns individually
@@ -763,7 +766,7 @@ class GeminiParallelProcessor:
         # Perform API call with retries
         retries = 0
         wait_time = 30  # Initial retry delay in seconds
-        while retries < 3:  # Maximum 3 retries for API call errors
+        while retries < self.api_call_retries:  # Maximum retries for API call errors
             response = None
             try:
                 # Global API call interval control - prevents IP ban from simultaneous requests
@@ -868,29 +871,29 @@ class GeminiParallelProcessor:
                     # 504: DEADLINE_EXCEEDED - Service couldn't complete in time
                     logging.warning(
                         f"Retryable server error ({error_code}): {e}. "
-                        f"Retry {retries + 1}/3..."
+                        f"Retry {retries + 1}/{self.api_call_retries}..."
                     )
                 else:
                     # Unknown error code - treat as retryable
                     logging.warning(
                         f"Unknown APIError ({error_code}): {e}. "
-                        f"Retry {retries + 1}/3..."
+                        f"Retry {retries + 1}/{self.api_call_retries}..."
                     )
             except Exception as e:
                 logging.error(
                     f"Unexpected error during API call: {type(e).__name__} - {e}. "
                     f"Traceback: {traceback.format_exc()}. "
-                    f"Retry {retries + 1}/{DEFAULT_API_CALL_RETRIES}..."
+                    f"Retry {retries + 1}/{self.api_call_retries}..."
                 )
 
             retries += 1
-            if retries < 3:
+            if retries < self.api_call_retries:
                 logging.info(f"Waiting {wait_time}s before retrying API call...")
                 time.sleep(wait_time)
                 wait_time = wait_time * 2**retries # Exponential backoff
             else:
                 logging.error(
-                    f"Failed API call after 3 retries."
+                    f"Failed API call after {self.api_call_retries} retries."
                 )
                 return PERSISTENT_ERROR_MARKER
 
@@ -1450,7 +1453,7 @@ class GeminiStreamingProcessor:
         # Perform API call with retries
         retries = 0
         wait_time = 30  # Initial retry delay in seconds
-        while retries < 3:  # Maximum 3 retries for API call errors
+        while retries < self.api_call_retries:  # Maximum retries for API call errors
             response = None
             try:
                 # Global API call interval control - prevents IP ban from simultaneous requests
@@ -1555,29 +1558,29 @@ class GeminiStreamingProcessor:
                     # 504: DEADLINE_EXCEEDED - Service couldn't complete in time
                     logging.warning(
                         f"Retryable server error ({error_code}): {e}. "
-                        f"Retry {retries + 1}/3..."
+                        f"Retry {retries + 1}/{self.api_call_retries}..."
                     )
                 else:
                     # Unknown error code - treat as retryable
                     logging.warning(
                         f"Unknown APIError ({error_code}): {e}. "
-                        f"Retry {retries + 1}/3..."
+                        f"Retry {retries + 1}/{self.api_call_retries}..."
                     )
             except Exception as e:
                 logging.error(
                     f"Unexpected error during API call: {type(e).__name__} - {e}. "
                     f"Traceback: {traceback.format_exc()}. "
-                    f"Retry {retries + 1}/{DEFAULT_API_CALL_RETRIES}..."
+                    f"Retry {retries + 1}/{self.api_call_retries}..."
                 )
 
             retries += 1
-            if retries < 3:
+            if retries < self.api_call_retries:
                 logging.info(f"Waiting {wait_time}s before retrying API call...")
                 time.sleep(wait_time)
                 wait_time = wait_time * 2**retries # Exponential backoff
             else:
                 logging.error(
-                    f"Failed API call after 3 retries."
+                    f"Failed API call after {self.api_call_retries} retries."
                 )
                 return PERSISTENT_ERROR_MARKER
 
