@@ -970,6 +970,10 @@ class GeminiParallelProcessor:
             # Perform API call
             result = self._make_single_api_call(client_instance, prompt_data)
             
+            # Update worker's last call time regardless of result (API call was made)
+            with self.worker_lock:
+                self.worker_last_call_time[worker_id] = time.time()
+            
             if result == EXHAUSTED_MARKER:
                 # Key is exhausted - mark it and try again with another key
                 logging.warning(f"Key {masked_key} exhausted for task {task_id}, trying another key")
@@ -980,12 +984,8 @@ class GeminiParallelProcessor:
                 logging.error(f"Persistent error for {task_id} with key {masked_key}")
                 return metadata, None, "Persistent API call error."
             else:
-                # Success! Update worker cooldown and key cooldown
+                # Success! Update key cooldown
                 logging.debug(f"Success for {task_id} with key {masked_key}")
-                
-                # Update worker's last call time for cooldown management
-                with self.worker_lock:
-                    self.worker_last_call_time[worker_id] = time.time()
                 
                 # Mark key as successful and put it in cooldown
                 self.key_manager.mark_key_successful(current_api_key)
@@ -1130,7 +1130,7 @@ class GeminiStreamingProcessor:
     """
     def __init__(self, key_manager: AdvancedApiKeyManager, model_name: str,
                  worker_cooldown_seconds: float = 20,  # 20 seconds worker cooldown
-                 api_call_interval: float = 2.0, 
+                 api_call_interval: float = 4.0, 
                  max_workers: int = 4,  # 4 workers by default
                  return_response: bool = False):
         """
@@ -1404,6 +1404,10 @@ class GeminiStreamingProcessor:
             # Perform API call
             result = self._make_single_api_call(client_instance, prompt_data)
             
+            # Update worker's last call time regardless of result (API call was made)
+            with self.worker_lock:
+                self.worker_last_call_time[worker_id] = time.time()
+            
             if result == EXHAUSTED_MARKER:
                 # Key is exhausted - mark it and try again with another key
                 logging.warning(f"Key {masked_key} exhausted for task {task_id}, trying another key")
@@ -1414,12 +1418,8 @@ class GeminiStreamingProcessor:
                 logging.error(f"Persistent error for {task_id} with key {masked_key}")
                 return metadata, None, "Persistent API call error."
             else:
-                # Success! Update worker cooldown and key cooldown
+                # Success! Update key cooldown
                 logging.debug(f"Success for {task_id} with key {masked_key}")
-                
-                # Update worker's last call time for cooldown management
-                with self.worker_lock:
-                    self.worker_last_call_time[worker_id] = time.time()
                 
                 # Mark key as successful and put it in cooldown
                 self.key_manager.mark_key_successful(current_api_key)
