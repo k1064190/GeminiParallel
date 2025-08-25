@@ -6,6 +6,7 @@ import logging
 import threading
 import concurrent.futures
 import traceback
+from typing import Union
 from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
@@ -18,9 +19,11 @@ import uuid
 try:
     # Try relative import (when run as package)
     from .gemini_media_processor import prepare_media_contents
+    from .types import PromptData
 except ImportError:
     # Try absolute import (when run as script/debugger)
     from gemini_media_processor import prepare_media_contents  # type: ignore
+    from types import PromptData  # type: ignore
 
 load_dotenv()
 
@@ -61,6 +64,7 @@ class AdvancedApiKeyManager:
                 - List of environment variable names containing API keys
                 - "all": Find all GEMINI_API_KEY_* environment variables
                 - Integer (e.g., 5): Search for GEMINI_API_KEY_1, GEMINI_API_KEY_2, ..., GEMINI_API_KEY_5
+                - Range string (e.g., "1-15"): Search for GEMINI_API_KEY_1 through GEMINI_API_KEY_15
                 - Single string: Use as single environment variable name
             paid_keys (str | list[str] | None): 
                 - "all": All keys are paid
@@ -268,6 +272,7 @@ class AdvancedApiKeyManager:
             - keylist_names = ["GEMINI_API_KEY_1", "GEMINI_API_KEY_2"]  # Specific key names
             - keylist_names = "all"  # Find all GEMINI_API_KEY_* environment variables
             - keylist_names = 5  # Load GEMINI_API_KEY_1, GEMINI_API_KEY_2, ..., GEMINI_API_KEY_5
+            - keylist_names = "1-15"  # Load GEMINI_API_KEY_1 through GEMINI_API_KEY_15
             - keylist_names = "SINGLE_KEY"  # Single key name
         """
         keys = []
@@ -280,6 +285,41 @@ class AdvancedApiKeyManager:
                 if env_var.startswith("GEMINI_API_KEY") and value and len(value) > 10:
                     keys.append(value)
                     logging.debug(f"Found API key from environment variable '{env_var}'.")
+        elif isinstance(keylist_names, str) and '-' in keylist_names:
+            # Handle range notation (e.g., "1-15")
+            try:
+                parts = keylist_names.split('-')
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    start_num = int(parts[0])
+                    end_num = int(parts[1])
+                    if start_num <= end_num:
+                        logging.info(f"Searching for keys GEMINI_API_KEY_{start_num} through GEMINI_API_KEY_{end_num}...")
+                        for i in range(start_num, end_num + 1):
+                            key_name = f"GEMINI_API_KEY_{i}"
+                            key = os.getenv(key_name)
+                            if key and len(key) > 10:
+                                keys.append(key)
+                                logging.debug(f"Loaded key from {key_name}.")
+                            else:
+                                logging.debug(f"Environment variable '{key_name}' not found or invalid.")
+                    else:
+                        logging.warning(f"Invalid range '{keylist_names}': start ({start_num}) should be <= end ({end_num})")
+                else:
+                    # Not a valid range format, treat as single key name
+                    key = os.getenv(keylist_names)
+                    if key and len(key) > 10:
+                        keys.append(key)
+                        logging.debug(f"Loaded key from {keylist_names}.")
+                    else:
+                        logging.warning(f"Environment variable '{keylist_names}' not found or invalid.")
+            except Exception as e:
+                logging.warning(f"Error parsing range '{keylist_names}': {e}. Treating as single key name.")
+                key = os.getenv(keylist_names)
+                if key and len(key) > 10:
+                    keys.append(key)
+                    logging.debug(f"Loaded key from {keylist_names}.")
+                else:
+                    logging.warning(f"Environment variable '{keylist_names}' not found or invalid.")
         elif isinstance(keylist_names, (int, str)) and str(keylist_names).isdigit():
             # Handle numeric input: search GEMINI_API_KEY_1, GEMINI_API_KEY_2, ..., GEMINI_API_KEY_n
             num_keys = int(keylist_names)
@@ -677,7 +717,7 @@ class GeminiParallelProcessor:
 
 
 
-    def _make_single_api_call(self, client_instance, prompt_data: dict) -> str:
+    def _make_single_api_call(self, client_instance, prompt_data: Union[dict, PromptData]) -> str:
         """
         Executes a single API call to the Gemini model.
         Handles retries for non-quota errors.
@@ -685,7 +725,7 @@ class GeminiParallelProcessor:
 
         Args:
             client_instance: An initialized genai.Client instance.
-            prompt_data (dict): Dictionary containing:
+            prompt_data (Union[dict, PromptData]): Dictionary or PromptData object containing:
                 - 'prompt' (str): The text prompt (can contain <audio> and <video> tokens for positioning)
                 - 'audio_path' (str or list[str], optional): Path(s) to audio file(s)
                 - 'audio_bytes' (bytes or list[bytes], optional): Audio bytes
@@ -707,12 +747,18 @@ class GeminiParallelProcessor:
             str: `EXHAUSTED_MARKER` if a ResourceExhausted error occurs.
             str: `PERSISTENT_ERROR_MARKER` if other errors persist after retries.
         """
+        # Convert PromptData to dict if needed
+        if isinstance(prompt_data, PromptData):
+            prompt_dict = prompt_data.to_dict()
+        else:
+            prompt_dict = prompt_data
+        
         # Prepare media contents using external utility
-        contents, error_msg = prepare_media_contents(client_instance, prompt_data)
+        contents, error_msg = prepare_media_contents(client_instance, prompt_dict)
         if contents is None:
             return PERSISTENT_ERROR_MARKER
         
-        generation_config = prompt_data.get('generation_config', {})
+        generation_config = prompt_dict.get('generation_config', {})
         
         # Perform API call with retries
         retries = 0
@@ -734,10 +780,61 @@ class GeminiParallelProcessor:
                     # Update last API call time before making the call
                     self._last_api_call_time = time.time()
                 
+                # Handle generation_config - support dict or types objects
+                if isinstance(generation_config, types.GenerateContentConfig):
+                    config = generation_config
+                elif isinstance(generation_config, dict) and generation_config:
+                    # Convert nested configs if they're dicts
+                    config_kwargs = generation_config.copy()
+                    
+                    # Convert thinkingConfig if it's a dict
+                    if 'thinkingConfig' in config_kwargs and isinstance(config_kwargs['thinkingConfig'], dict):
+                        config_kwargs['thinkingConfig'] = types.ThinkingConfig(**config_kwargs['thinkingConfig'])
+                    elif 'thinking_config' in config_kwargs and isinstance(config_kwargs['thinking_config'], dict):
+                        config_kwargs['thinkingConfig'] = types.ThinkingConfig(**config_kwargs.pop('thinking_config'))
+                    
+                    # Convert speechConfig if it's a dict
+                    if 'speechConfig' in config_kwargs and isinstance(config_kwargs['speechConfig'], dict):
+                        config_kwargs['speechConfig'] = types.SpeechConfig(**config_kwargs['speechConfig'])
+                    elif 'speech_config' in config_kwargs and isinstance(config_kwargs['speech_config'], dict):
+                        config_kwargs['speechConfig'] = types.SpeechConfig(**config_kwargs.pop('speech_config'))
+                    
+                    # Convert snake_case to camelCase for other fields
+                    if 'max_output_tokens' in config_kwargs:
+                        config_kwargs['maxOutputTokens'] = config_kwargs.pop('max_output_tokens')
+                    if 'stop_sequences' in config_kwargs:
+                        config_kwargs['stopSequences'] = config_kwargs.pop('stop_sequences')
+                    if 'response_mime_type' in config_kwargs:
+                        config_kwargs['responseMimeType'] = config_kwargs.pop('response_mime_type')
+                    if 'response_logprobs' in config_kwargs:
+                        config_kwargs['responseLogprobs'] = config_kwargs.pop('response_logprobs')
+                    if 'top_p' in config_kwargs:
+                        config_kwargs['topP'] = config_kwargs.pop('top_p')
+                    if 'top_k' in config_kwargs:
+                        config_kwargs['topK'] = config_kwargs.pop('top_k')
+                    if 'presence_penalty' in config_kwargs:
+                        config_kwargs['presencePenalty'] = config_kwargs.pop('presence_penalty')
+                    if 'frequency_penalty' in config_kwargs:
+                        config_kwargs['frequencyPenalty'] = config_kwargs.pop('frequency_penalty')
+                    if 'candidate_count' in config_kwargs:
+                        config_kwargs['candidateCount'] = config_kwargs.pop('candidate_count')
+                    if 'response_modalities' in config_kwargs:
+                        config_kwargs['responseModalities'] = config_kwargs.pop('response_modalities')
+                    if 'media_resolution' in config_kwargs:
+                        config_kwargs['mediaResolution'] = config_kwargs.pop('media_resolution')
+                    if 'response_schema' in config_kwargs:
+                        config_kwargs['responseSchema'] = config_kwargs.pop('response_schema')
+                    if 'response_json_schema' in config_kwargs:
+                        config_kwargs['responseJsonSchema'] = config_kwargs.pop('response_json_schema')
+                    
+                    config = types.GenerateContentConfig(**config_kwargs)
+                else:
+                    config = types.GenerateContentConfig()
+                
                 response = client_instance.models.generate_content(
                     model=self.model_name,
                     contents=contents,
-                    config=genai.types.GenerateContentConfig(**generation_config)
+                    config=config
                 )
                 response_text = response.text.strip()
                 
@@ -799,7 +896,7 @@ class GeminiParallelProcessor:
 
         return PERSISTENT_ERROR_MARKER
 
-    def _worker_task(self, prompt_data: dict) -> tuple:
+    def _worker_task(self, prompt_data: Union[dict, PromptData]) -> tuple:
         """
         Worker function with dynamic key allocation and worker cooldown management.
         
@@ -809,14 +906,19 @@ class GeminiParallelProcessor:
         4. No permanent key assignment - keys are grabbed dynamically per task
 
         Args:
-            prompt_data (dict): A dictionary containing 'prompt' (str) and
+            prompt_data (Union[dict, PromptData]): A dictionary or PromptData object containing 'prompt' (str) and
                                 'metadata' (dict) for the task.
 
         Returns:
             tuple: (metadata_dict, api_response_text_or_marker, error_message_str)
         """
-        prompt = prompt_data['prompt']
-        metadata = prompt_data['metadata']
+        # Handle both dict and PromptData
+        if isinstance(prompt_data, PromptData):
+            prompt = prompt_data.prompt
+            metadata = prompt_data.metadata
+        else:
+            prompt = prompt_data['prompt']
+            metadata = prompt_data['metadata']
         task_id = metadata.get('task_id', 'unknown_task')
         worker_id = threading.current_thread().name
 
@@ -895,15 +997,15 @@ class GeminiParallelProcessor:
         logging.error(f"Task {task_id} failed after {max_attempts} key allocation attempts")
         return metadata, None, f"Failed after {max_attempts} key allocation attempts"
 
-    def process_prompts(self, prompts_with_metadata: list[dict]) -> list[tuple]:
+    def process_prompts(self, prompts_with_metadata: list[Union[dict, PromptData]]) -> list[tuple]:
         """
         Processes a list of prompts in parallel using dynamic key allocation.
         Workers grab any available key when ready to work, with individual worker cooldowns.
         Supports text-only and multimedia inputs with flexible positioning.
 
         Args:
-            prompts_with_metadata (list[dict]): A list of dictionaries, where each
-                                                dictionary can contain:
+            prompts_with_metadata (list[Union[dict, PromptData]]): A list of dictionaries or PromptData objects, where each
+                                                can contain:
                                                 - 'prompt' (str): The text prompt to send to Gemini.
                                                   Can contain <audio> and <video> tokens for positioning.
                                                 - 'audio_path' (str or list[str], optional): Path(s) to audio file(s).
@@ -954,11 +1056,14 @@ class GeminiParallelProcessor:
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=actual_workers, thread_name_prefix="GeminiAPIWorker"
         ) as executor:
-            # Map each prompt_data dictionary to the _worker_task
-            futures = {
-                executor.submit(self._worker_task, prompt_data): prompt_data['metadata']
-                for prompt_data in prompts_with_metadata
-            }
+            # Map each prompt_data to the _worker_task
+            futures = {}
+            for prompt_data in prompts_with_metadata:
+                if isinstance(prompt_data, PromptData):
+                    metadata = prompt_data.metadata
+                else:
+                    metadata = prompt_data['metadata']
+                futures[executor.submit(self._worker_task, prompt_data)] = metadata
 
             processed_count = 0
             last_log_time = time.time()
@@ -1130,12 +1235,12 @@ class GeminiStreamingProcessor:
         
         logging.info("All persistent workers stopped.")
 
-    def process_single(self, prompt_data: dict, timeout: float = 300.0) -> tuple:
+    def process_single(self, prompt_data: Union[dict, PromptData], timeout: float | None = None) -> tuple:
         """
         Process a single prompt and return the result.
         
         Args:
-            prompt_data (dict): Dictionary containing prompt and metadata
+            prompt_data (Union[dict, PromptData]): Dictionary or PromptData object containing prompt and metadata
             timeout (float): Maximum time to wait for result (default: 5 minutes)
             
         Returns:
@@ -1156,10 +1261,14 @@ class GeminiStreamingProcessor:
         self.result_events[request_id] = result_event
         
         # Add task ID if not present
-        if 'metadata' not in prompt_data:
-            prompt_data['metadata'] = {}
-        if 'task_id' not in prompt_data['metadata']:
-            prompt_data['metadata']['task_id'] = f"stream_{request_id[:8]}"
+        if isinstance(prompt_data, PromptData):
+            if 'task_id' not in prompt_data.metadata:
+                prompt_data.metadata['task_id'] = f"stream_{request_id[:8]}"
+        else:
+            if 'metadata' not in prompt_data:
+                prompt_data['metadata'] = {}
+            if 'task_id' not in prompt_data['metadata']:
+                prompt_data['metadata']['task_id'] = f"stream_{request_id[:8]}"
         
         # Submit request to queue
         request = {
@@ -1220,7 +1329,7 @@ class GeminiStreamingProcessor:
         
         logging.debug(f"Persistent worker {worker_id} stopped.")
 
-    def _process_single_request(self, prompt_data: dict, worker_id: str) -> tuple:
+    def _process_single_request(self, prompt_data: Union[dict, PromptData], worker_id: str) -> tuple:
         """
         Process a single request using dynamic key allocation for maximum efficiency.
         
@@ -1232,14 +1341,19 @@ class GeminiStreamingProcessor:
         immediately tries another available key instead of waiting for recovery.
         
         Args:
-            prompt_data (dict): The prompt data to process
+            prompt_data (Union[dict, PromptData]): The prompt data to process
             worker_id (str): Worker identifier
             
         Returns:
             tuple: (metadata_dict, api_response_text_or_marker, error_message_str)
         """
-        prompt = prompt_data.get('prompt', '')
-        metadata = prompt_data.get('metadata', {})
+        # Handle both dict and PromptData
+        if isinstance(prompt_data, PromptData):
+            prompt = prompt_data.prompt
+            metadata = prompt_data.metadata
+        else:
+            prompt = prompt_data.get('prompt', '')
+            metadata = prompt_data.get('metadata', {})
         task_id = metadata.get('task_id', 'unknown_task')
 
         if not prompt:
@@ -1316,16 +1430,22 @@ class GeminiStreamingProcessor:
         logging.error(f"Task {task_id} failed after {max_attempts} key allocation attempts")
         return metadata, None, f"Failed after {max_attempts} key allocation attempts"
 
-    def _make_single_api_call(self, client_instance, prompt_data: dict) -> str:
+    def _make_single_api_call(self, client_instance, prompt_data: Union[dict, PromptData]) -> str:
         """
         Executes a single API call - same logic as GeminiParallelProcessor but optimized.
         """
+        # Convert PromptData to dict if needed
+        if isinstance(prompt_data, PromptData):
+            prompt_dict = prompt_data.to_dict()
+        else:
+            prompt_dict = prompt_data
+        
         # Prepare media contents using external utility
-        contents, error_msg = prepare_media_contents(client_instance, prompt_data)
+        contents, error_msg = prepare_media_contents(client_instance, prompt_dict)
         if contents is None:
             return PERSISTENT_ERROR_MARKER
         
-        generation_config = prompt_data.get('generation_config', {})
+        generation_config = prompt_dict.get('generation_config', {})
         
         # Perform API call with retries
         retries = 0
@@ -1347,10 +1467,61 @@ class GeminiStreamingProcessor:
                     # Update last API call time before making the call
                     self._last_api_call_time = time.time()
                 
+                # Handle generation_config - support dict or types objects
+                if isinstance(generation_config, types.GenerateContentConfig):
+                    config = generation_config
+                elif isinstance(generation_config, dict) and generation_config:
+                    # Convert nested configs if they're dicts
+                    config_kwargs = generation_config.copy()
+                    
+                    # Convert thinkingConfig if it's a dict
+                    if 'thinkingConfig' in config_kwargs and isinstance(config_kwargs['thinkingConfig'], dict):
+                        config_kwargs['thinkingConfig'] = types.ThinkingConfig(**config_kwargs['thinkingConfig'])
+                    elif 'thinking_config' in config_kwargs and isinstance(config_kwargs['thinking_config'], dict):
+                        config_kwargs['thinkingConfig'] = types.ThinkingConfig(**config_kwargs.pop('thinking_config'))
+                    
+                    # Convert speechConfig if it's a dict
+                    if 'speechConfig' in config_kwargs and isinstance(config_kwargs['speechConfig'], dict):
+                        config_kwargs['speechConfig'] = types.SpeechConfig(**config_kwargs['speechConfig'])
+                    elif 'speech_config' in config_kwargs and isinstance(config_kwargs['speech_config'], dict):
+                        config_kwargs['speechConfig'] = types.SpeechConfig(**config_kwargs.pop('speech_config'))
+                    
+                    # Convert snake_case to camelCase for other fields
+                    if 'max_output_tokens' in config_kwargs:
+                        config_kwargs['maxOutputTokens'] = config_kwargs.pop('max_output_tokens')
+                    if 'stop_sequences' in config_kwargs:
+                        config_kwargs['stopSequences'] = config_kwargs.pop('stop_sequences')
+                    if 'response_mime_type' in config_kwargs:
+                        config_kwargs['responseMimeType'] = config_kwargs.pop('response_mime_type')
+                    if 'response_logprobs' in config_kwargs:
+                        config_kwargs['responseLogprobs'] = config_kwargs.pop('response_logprobs')
+                    if 'top_p' in config_kwargs:
+                        config_kwargs['topP'] = config_kwargs.pop('top_p')
+                    if 'top_k' in config_kwargs:
+                        config_kwargs['topK'] = config_kwargs.pop('top_k')
+                    if 'presence_penalty' in config_kwargs:
+                        config_kwargs['presencePenalty'] = config_kwargs.pop('presence_penalty')
+                    if 'frequency_penalty' in config_kwargs:
+                        config_kwargs['frequencyPenalty'] = config_kwargs.pop('frequency_penalty')
+                    if 'candidate_count' in config_kwargs:
+                        config_kwargs['candidateCount'] = config_kwargs.pop('candidate_count')
+                    if 'response_modalities' in config_kwargs:
+                        config_kwargs['responseModalities'] = config_kwargs.pop('response_modalities')
+                    if 'media_resolution' in config_kwargs:
+                        config_kwargs['mediaResolution'] = config_kwargs.pop('media_resolution')
+                    if 'response_schema' in config_kwargs:
+                        config_kwargs['responseSchema'] = config_kwargs.pop('response_schema')
+                    if 'response_json_schema' in config_kwargs:
+                        config_kwargs['responseJsonSchema'] = config_kwargs.pop('response_json_schema')
+                    
+                    config = types.GenerateContentConfig(**config_kwargs)
+                else:
+                    config = types.GenerateContentConfig()
+                
                 response = client_instance.models.generate_content(
                     model=self.model_name,
                     contents=contents,
-                    config=genai.types.GenerateContentConfig(**generation_config)
+                    config=config
                 )
                 response_text = response.text
                 

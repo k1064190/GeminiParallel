@@ -1,0 +1,11 @@
+[project]
+name = "gemini-parallel"
+version = "0.6.0"
+description = "Gemini Parallel Processing System"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "google-api-core>=2.25.0",
+    "google-genai>=1.18.0",
+    "python-dotenv>=1.1.0",
+]

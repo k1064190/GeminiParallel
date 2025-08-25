@@ -12,6 +12,7 @@ from .gemini_tts import (
     TTS_VOICES,
     TTS_MODELS,
 )
+from . import types
 
 __all__ = [
     "GeminiParallelProcessor",
@@ -22,4 +23,5 @@ __all__ = [
     "text_to_speech",
     "TTS_VOICES",
     "TTS_MODELS",
+    "types",
 ]
