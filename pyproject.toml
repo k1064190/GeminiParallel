@@ -1,6 +1,6 @@
 [project]
 name = "gemini-parallel"
-version = "0.6.1"
+version = "0.6.3"
 description = "Gemini Parallel Processing System"
 readme = "README.md"
 requires-python = ">=3.10"

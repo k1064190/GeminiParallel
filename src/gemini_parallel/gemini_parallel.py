@@ -6,6 +6,7 @@ import logging
 import threading
 import concurrent.futures
 import traceback
+import random
 from typing import Union
 from google import genai
 from google.genai import types
@@ -412,22 +413,25 @@ class AdvancedApiKeyManager:
                     logging.info(f"Worker {worker_id} releasing unusable key ...{assigned_key[-4:]} (status: {key_info['status']})")
                     self._release_key_from_worker(worker_id, assigned_key)
             
-            # Find an available key for assignment
+            # Find an available key for assignment - randomize selection
             available_key = None
-            for key in self.available_keys.copy():
+            available_keys_list = list(self.available_keys)
+            random.shuffle(available_keys_list)  # Randomize to distribute load
+            for key in available_keys_list:
                 key_info = self.key_info[key]
                 if key_info['status'] not in [KEY_STATUS_FULLY_EXHAUSTED, KEY_STATUS_FAILED_INIT]:
                     available_key = key
                     break
             
             if available_key is None:
-                # Check if any assigned keys can be reassigned (if their worker is done)
-                for key, info in self.key_info.items():
-                    if (info['assigned_worker'] is None and 
-                        info['status'] not in [KEY_STATUS_FULLY_EXHAUSTED, KEY_STATUS_FAILED_INIT]):
-                        available_key = key
-                        self.available_keys.add(key)
-                        break
+                # Check if any assigned keys can be reassigned (if their worker is done) - randomize
+                unassigned_keys = [(key, info) for key, info in self.key_info.items()
+                                   if info['assigned_worker'] is None and 
+                                   info['status'] not in [KEY_STATUS_FULLY_EXHAUSTED, KEY_STATUS_FAILED_INIT]]
+                if unassigned_keys:
+                    random.shuffle(unassigned_keys)  # Randomize selection
+                    available_key = unassigned_keys[0][0]
+                    self.available_keys.add(available_key)
             
             if available_key is None:
                 # No usable keys available
@@ -625,12 +629,12 @@ class AdvancedApiKeyManager:
             # Update key statuses based on time
             self._update_key_status_based_on_time()
             
-            # Find any key that can be used immediately
+            # Find any key that can be used immediately - randomize selection
             available_key = None
-            for key, info in self.key_info.items():
-                if info['status'] == KEY_STATUS_AVAILABLE:
-                    available_key = key
-                    break
+            available_keys = [(key, info) for key, info in self.key_info.items()
+                              if info['status'] == KEY_STATUS_AVAILABLE]
+            if available_keys:
+                available_key = random.choice(available_keys)[0]  # Random selection
             
             if available_key is None:
                 # Check status counts for decision making
@@ -1135,6 +1139,7 @@ class GeminiStreamingProcessor:
                  worker_cooldown_seconds: float = 20,  # 20 seconds worker cooldown
                  api_call_interval: float = 4.0, 
                  max_workers: int = 4,  # 4 workers by default
+                 api_call_retries: int = 3,  # 3 retries by default
                  return_response: bool = False):
         """
         Initialize the streaming processor with dual cooldown system.
@@ -1145,6 +1150,7 @@ class GeminiStreamingProcessor:
             worker_cooldown_seconds (float): Time (in seconds) each worker waits between API calls.
             api_call_interval (float): Minimum time between API calls (global IP ban protection).
             max_workers (int): Maximum number of persistent worker threads.
+            api_call_retries (int): Maximum number of retries for API call errors (default: 3).
             return_response (bool): Whether to return the full response object instead of just the text.
         """
         self.key_manager = key_manager
@@ -1152,6 +1158,7 @@ class GeminiStreamingProcessor:
         self.worker_cooldown_seconds = worker_cooldown_seconds
         self.api_call_interval = api_call_interval
         self.max_workers = max_workers
+        self.api_call_retries = api_call_retries
         self.return_response = return_response
         
         # Track worker cooldowns individually
