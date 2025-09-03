@@ -52,11 +52,12 @@ logging.basicConfig(
 class AdvancedApiKeyManager:
     """
     Advanced API key manager: supports worker-specific key assignment with cooldown, 
-    staged exhausted states, and time-based recovery.
+    staged exhausted states, time-based recovery, and adaptive cooldown adjustment.
     """
     def __init__(self, keylist_names, 
                  paid_keys=None,
-                 key_settings=None):
+                 key_settings=None,
+                 adaptive_cooldown_settings=None):
         """
         Initialize the advanced API key manager.
 
@@ -66,7 +67,6 @@ class AdvancedApiKeyManager:
                 - "all": Find all GEMINI_API_KEY_* environment variables
                 - Integer (e.g., 5): Search for GEMINI_API_KEY_1, GEMINI_API_KEY_2, ..., GEMINI_API_KEY_5
                 - Range string (e.g., "1-15"): Search for GEMINI_API_KEY_1 through GEMINI_API_KEY_15
-                - Single string: Use as single environment variable name
             paid_keys (str | list[str] | None): 
                 - "all": All keys are paid
                 - List of strings: Environment variable names of paid keys (e.g., ["GEMINI_API_KEY_1", "GEMINI_API_KEY_3"])
@@ -87,8 +87,41 @@ class AdvancedApiKeyManager:
                     }
                 }
                 If not provided, default settings will be used.
+            adaptive_cooldown_settings (dict | None): Settings for adaptive cooldown adjustment
+                Example: {
+                    "enabled": True,  # Whether to enable adaptive cooldown
+                    "exhaustion_threshold": 0.02,  # Threshold rate (2% default)
+                    "initial_multiplier": 1.1,  # Initial cooldown increase (10%)
+                    "max_multiplier": 1.5,  # Maximum cooldown increase (50%)
+                    "multiplier_increment": 0.1,  # How much to increase multiplier each time
+                    "api_call_window": 300,  # Window to track API calls (5 minutes)
+                    "cooldown_recovery_rate": 0.9  # Multiplier for cooldown recovery (90% of previous)
+                }
         """
         self.paid_keys = paid_keys
+        
+        # Default adaptive cooldown settings
+        default_adaptive_settings = {
+            "enabled": True,
+            "exhaustion_threshold": 0.02,  # 2% exhaustion rate threshold
+            "initial_multiplier": 1.1,  # Start with 10% increase
+            "max_multiplier": 1.5,  # Maximum 50% increase
+            "multiplier_increment": 0.1,  # Increase by 10% each time
+            "api_call_window": 300,  # 5 minute window
+            "cooldown_recovery_rate": 0.9  # Reduce multiplier by 10% on recovery
+        }
+        
+        # Parse adaptive cooldown settings or use defaults
+        if adaptive_cooldown_settings is None:
+            self.adaptive_settings = default_adaptive_settings
+        else:
+            self.adaptive_settings = {**default_adaptive_settings, **adaptive_cooldown_settings}
+        
+        # Adaptive cooldown tracking
+        self.api_call_history = []  # List of (timestamp, was_exhausted) tuples
+        self.current_cooldown_multiplier = 1.0  # Current multiplier for cooldowns
+        self.last_adjustment_time = 0  # Last time cooldowns were adjusted
+        self.adjustment_count = 0  # Number of times cooldowns have been increased
         
         # Default settings for each category
         default_free_settings = {
@@ -150,6 +183,7 @@ class AdvancedApiKeyManager:
         self.available_keys = set(self.api_keys)  # Keys not assigned to any worker
         
         self._lock = threading.Lock()
+        self._adaptive_lock = threading.Lock()  # Separate lock for adaptive tracking
 
         # Count free and paid keys
         free_count = sum(1 for info in self.key_info.values() if info['category'] == 'free')
@@ -165,6 +199,11 @@ class AdvancedApiKeyManager:
                             f"Exhausted wait: {settings['exhausted_wait_seconds']}s, "
                             f"Fully exhausted wait: {settings['fully_exhausted_wait_seconds']}s, "
                             f"Max retries: {settings['max_exhausted_retries']}")
+        
+        # Log adaptive cooldown settings if enabled
+        if self.adaptive_settings['enabled']:
+            logging.info(f"Adaptive cooldown enabled: threshold={self.adaptive_settings['exhaustion_threshold']:.1%}, "
+                        f"window={self.adaptive_settings['api_call_window']}s")
 
     def _determine_paid_keys(self, paid_keys):
         """
@@ -227,6 +266,30 @@ class AdvancedApiKeyManager:
                     keys.append(value)
                     key_to_env_name[value] = env_var
                     logging.debug(f"Found API key from environment variable '{env_var}'.")
+        elif isinstance(keylist_names, str) and '-' in keylist_names:
+            # Handle range notation (e.g., "1-15")
+            try:
+                parts = keylist_names.split('-')
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    start_num = int(parts[0])
+                    end_num = int(parts[1])
+                    if start_num <= end_num:
+                        logging.info(f"Searching for keys GEMINI_API_KEY_{start_num} through GEMINI_API_KEY_{end_num}...")
+                        for i in range(start_num, end_num + 1):
+                            key_name = f"GEMINI_API_KEY_{i}"
+                            key = os.getenv(key_name)
+                            if key and len(key) > 10:
+                                keys.append(key)
+                                key_to_env_name[key] = key_name
+                                logging.debug(f"Loaded key from {key_name}.")
+                            else:
+                                logging.debug(f"Environment variable '{key_name}' not found or invalid.")
+                    else:
+                        logging.warning(f"Invalid range '{keylist_names}': start ({start_num}) should be <= end ({end_num})")
+                else:
+                    logging.warning(f"Invalid range format '{keylist_names}'. Expected format: 'start-end' (e.g., '1-15')")
+            except Exception as e:
+                logging.error(f"Error parsing range '{keylist_names}': {e}")
         elif isinstance(keylist_names, (int, str)) and str(keylist_names).isdigit():
             # Handle numeric input: search GEMINI_API_KEY_1, GEMINI_API_KEY_2, ..., GEMINI_API_KEY_n
             num_keys = int(keylist_names)
@@ -250,17 +313,6 @@ class AdvancedApiKeyManager:
                     logging.debug(f"Loaded key from {key_name}.")
                 else:
                     logging.warning(f"Environment variable '{key_name}' not found or invalid.")
-        else:
-            # Handle single key name
-            key_names = [keylist_names] if isinstance(keylist_names, str) else keylist_names
-            for key_name in key_names:
-                key = os.getenv(key_name)
-                if key and len(key) > 10:
-                    keys.append(key)
-                    key_to_env_name[key] = key_name
-                    logging.debug(f"Loaded key from {key_name}.")
-                else:
-                    logging.warning(f"Environment variable '{key_name}' not found or invalid.")
         
         logging.info(f"Successfully loaded {len(keys)} valid API keys.")
         return keys, key_to_env_name
@@ -274,7 +326,6 @@ class AdvancedApiKeyManager:
             - keylist_names = "all"  # Find all GEMINI_API_KEY_* environment variables
             - keylist_names = 5  # Load GEMINI_API_KEY_1, GEMINI_API_KEY_2, ..., GEMINI_API_KEY_5
             - keylist_names = "1-15"  # Load GEMINI_API_KEY_1 through GEMINI_API_KEY_15
-            - keylist_names = "SINGLE_KEY"  # Single key name
         """
         keys = []
         
@@ -306,21 +357,9 @@ class AdvancedApiKeyManager:
                     else:
                         logging.warning(f"Invalid range '{keylist_names}': start ({start_num}) should be <= end ({end_num})")
                 else:
-                    # Not a valid range format, treat as single key name
-                    key = os.getenv(keylist_names)
-                    if key and len(key) > 10:
-                        keys.append(key)
-                        logging.debug(f"Loaded key from {keylist_names}.")
-                    else:
-                        logging.warning(f"Environment variable '{keylist_names}' not found or invalid.")
+                    logging.warning(f"Invalid range format '{keylist_names}'. Expected format: 'start-end' (e.g., '1-15')")
             except Exception as e:
-                logging.warning(f"Error parsing range '{keylist_names}': {e}. Treating as single key name.")
-                key = os.getenv(keylist_names)
-                if key and len(key) > 10:
-                    keys.append(key)
-                    logging.debug(f"Loaded key from {keylist_names}.")
-                else:
-                    logging.warning(f"Environment variable '{keylist_names}' not found or invalid.")
+                logging.error(f"Error parsing range '{keylist_names}': {e}")
         elif isinstance(keylist_names, (int, str)) and str(keylist_names).isdigit():
             # Handle numeric input: search GEMINI_API_KEY_1, GEMINI_API_KEY_2, ..., GEMINI_API_KEY_n
             num_keys = int(keylist_names)
@@ -342,43 +381,35 @@ class AdvancedApiKeyManager:
                     logging.debug(f"Loaded key from {key_name}.")
                 else:
                     logging.warning(f"Environment variable '{key_name}' not found or invalid.")
-        else:
-            # Handle single key name
-            key_names = [keylist_names] if isinstance(keylist_names, str) else keylist_names
-            for key_name in key_names:
-                key = os.getenv(key_name)
-                if key and len(key) > 10:
-                    keys.append(key)
-                    logging.debug(f"Loaded key from {key_name}.")
-                else:
-                    logging.warning(f"Environment variable '{key_name}' not found or invalid.")
         
         logging.info(f"Successfully loaded {len(keys)} valid API keys.")
         return keys
 
     def _update_key_status_based_on_time(self):
-        """Update key statuses based on time."""
+        """Update key statuses based on time with adaptive cooldown adjustments."""
         current_time = time.time()
         
         for key, info in self.key_info.items():
             category = info['category']
-            settings = self.category_settings[category]
+            # Get adjusted settings with multiplier applied
+            settings = self.get_adjusted_cooldowns(category)
             
             if info['status'] == KEY_STATUS_COOLDOWN:
-                # Check if cooldown time has passed based on category settings
+                # Check if cooldown time has passed based on adjusted settings
                 if current_time - info['status_change_time'] >= settings['key_cooldown_seconds']:
                     info['status'] = KEY_STATUS_AVAILABLE
                     logging.debug(f"{category.capitalize()} key ...{key[-4:]} cooldown finished, now AVAILABLE")
             
             elif info['status'] == KEY_STATUS_TEMPORARILY_EXHAUSTED:
-                # Check if temporary exhaustion time has passed based on category settings
+                # Check if temporary exhaustion time has passed based on adjusted settings
                 if current_time - info['status_change_time'] >= settings['exhausted_wait_seconds']:
                     info['status'] = KEY_STATUS_AVAILABLE
                     logging.info(f"{category.capitalize()} key ...{key[-4:]} temporary exhaustion recovered, now AVAILABLE")
             
             elif info['status'] == KEY_STATUS_FULLY_EXHAUSTED:
-                # Check if full exhaustion time has passed based on category settings
-                if current_time - info['status_change_time'] >= settings['fully_exhausted_wait_seconds']:
+                # Check if full exhaustion time has passed based on category settings (not adjusted)
+                base_settings = self.category_settings[category]
+                if current_time - info['status_change_time'] >= base_settings['fully_exhausted_wait_seconds']:
                     info['status'] = KEY_STATUS_AVAILABLE
                     info['exhausted_count'] = 0  # Reset count
                     logging.info(f"{category.capitalize()} key ...{key[-4:]} full exhaustion recovered, now AVAILABLE")
@@ -505,7 +536,7 @@ class AdvancedApiKeyManager:
 
     def mark_key_used(self, api_key: str):
         """
-        Mark a key as just used (put it in cooldown based on its category).
+        Mark a key as just used (put it in cooldown based on its category with adaptive adjustments).
         
         Args:
             api_key (str): The API key that was used
@@ -517,7 +548,9 @@ class AdvancedApiKeyManager:
             
             info = self.key_info[api_key]
             category = info['category']
-            cooldown_seconds = self.category_settings[category]['key_cooldown_seconds']
+            # Get adjusted cooldown with multiplier applied
+            adjusted_settings = self.get_adjusted_cooldowns(category)
+            cooldown_seconds = adjusted_settings['key_cooldown_seconds']
             
             info['last_used_time'] = time.time()
             
@@ -525,7 +558,7 @@ class AdvancedApiKeyManager:
             if cooldown_seconds > 0:
                 info['status'] = KEY_STATUS_COOLDOWN
                 info['status_change_time'] = time.time()
-                logging.debug(f"{category.capitalize()} key ...{api_key[-4:]} marked as used, now in COOLDOWN for {cooldown_seconds}s")
+                logging.debug(f"{category.capitalize()} key ...{api_key[-4:]} marked as used, now in COOLDOWN for {cooldown_seconds:.1f}s")
             else:
                 # No cooldown for this category (e.g., paid keys with 0 cooldown)
                 info['status'] = KEY_STATUS_AVAILABLE
@@ -535,6 +568,7 @@ class AdvancedApiKeyManager:
         """
         Mark key as exhausted.
         Classify as temporary or full exhaustion based on consecutive exhausted count and category settings.
+        Also tracks exhaustion for adaptive cooldown adjustment.
         """
         with self._lock:
             if api_key not in self.key_info:
@@ -551,8 +585,12 @@ class AdvancedApiKeyManager:
             
             masked_key = f"...{api_key[-4:]}" if len(api_key) > 4 else "invalid key"
             
+            # Track this exhaustion event for adaptive cooldown
+            if self.adaptive_settings['enabled']:
+                self._track_api_call(current_time, was_exhausted=True)
+            
             if info['exhausted_count'] >= settings['max_exhausted_retries']:
-                # Change to fully exhausted status
+                # Change to fully exhausted status (not adjusted)
                 info['status'] = KEY_STATUS_FULLY_EXHAUSTED
                 info['status_change_time'] = current_time
                 wait_hours = settings['fully_exhausted_wait_seconds'] / 3600
@@ -561,19 +599,21 @@ class AdvancedApiKeyManager:
                     f"(count: {info['exhausted_count']}) - waiting {wait_hours:.1f}h"
                 )
             else:
-                # Change to temporarily exhausted status
+                # Change to temporarily exhausted status (use adjusted wait time)
+                adjusted_settings = self.get_adjusted_cooldowns(category)
                 info['status'] = KEY_STATUS_TEMPORARILY_EXHAUSTED
                 info['status_change_time'] = current_time
-                wait_minutes = settings['exhausted_wait_seconds'] / 60
+                wait_minutes = adjusted_settings['exhausted_wait_seconds'] / 60
                 logging.warning(
                     f"{category.capitalize()} key {masked_key} marked as TEMPORARILY_EXHAUSTED "
                     f"(count: {info['exhausted_count']}) - waiting {wait_minutes:.1f}m"
+                    f"{' (adjusted)' if self.current_cooldown_multiplier != 1.0 else ''}"
                 )
 
     def mark_key_successful(self, api_key):
         """
         Called when key usage is successful.
-        Resets exhausted count.
+        Resets exhausted count and tracks successful call for adaptive cooldown.
         """
         with self._lock:
             if api_key not in self.key_info:
@@ -583,6 +623,11 @@ class AdvancedApiKeyManager:
             if info['exhausted_count'] > 0:
                 logging.info(f"Key ...{api_key[-4:]} successful, resetting exhausted count from {info['exhausted_count']} to 0")
                 info['exhausted_count'] = 0
+            
+            # Track this successful call for adaptive cooldown
+            if self.adaptive_settings['enabled']:
+                current_time = time.time()
+                self._track_api_call(current_time, was_exhausted=False)
 
     def mark_key_failed_init(self, api_key):
         """Mark key initialization failure."""
@@ -674,6 +719,150 @@ class AdvancedApiKeyManager:
         masked_key = f"...{api_key[-4:]}" if len(api_key) > 4 else "invalid key"
         worker_msg = f" from worker {worker_id}" if worker_id else ""
         logging.debug(f"Key {masked_key} returned{worker_msg}, now in cooldown")
+    
+    def _track_api_call(self, timestamp: float, was_exhausted: bool):
+        """
+        Track an API call for adaptive cooldown calculation.
+        
+        Args:
+            timestamp (float): Time of the API call
+            was_exhausted (bool): Whether this call resulted in exhaustion
+        """
+        with self._adaptive_lock:
+            # Add to history
+            self.api_call_history.append((timestamp, was_exhausted))
+            
+            # Clean up old entries outside the window
+            window_start = timestamp - self.adaptive_settings['api_call_window']
+            self.api_call_history = [(t, e) for t, e in self.api_call_history if t >= window_start]
+            
+            # Check if we should adjust cooldowns
+            if len(self.api_call_history) >= 10:  # Need at least 10 calls to calculate rate
+                self._check_and_adjust_cooldowns(timestamp)
+    
+    def _check_and_adjust_cooldowns(self, current_time: float):
+        """
+        Check exhaustion rate and adjust cooldowns if threshold is exceeded.
+        
+        Args:
+            current_time (float): Current timestamp
+        """
+        # Calculate exhaustion rate
+        total_calls = len(self.api_call_history)
+        exhausted_calls = sum(1 for _, was_exhausted in self.api_call_history if was_exhausted)
+        exhaustion_rate = exhausted_calls / total_calls if total_calls > 0 else 0
+        
+        # Check if we need to adjust cooldowns
+        threshold = self.adaptive_settings['exhaustion_threshold']
+        
+        if exhaustion_rate > threshold:
+            # Increase cooldowns
+            if self.current_cooldown_multiplier < self.adaptive_settings['max_multiplier']:
+                old_multiplier = self.current_cooldown_multiplier
+                
+                # Increase multiplier progressively
+                if self.adjustment_count == 0:
+                    self.current_cooldown_multiplier = self.adaptive_settings['initial_multiplier']
+                else:
+                    self.current_cooldown_multiplier = min(
+                        self.current_cooldown_multiplier + self.adaptive_settings['multiplier_increment'],
+                        self.adaptive_settings['max_multiplier']
+                    )
+                
+                self.adjustment_count += 1
+                self.last_adjustment_time = current_time
+                
+                logging.warning(
+                    f"Exhaustion rate {exhaustion_rate:.1%} exceeds threshold {threshold:.1%}. "
+                    f"Increasing cooldown multiplier from {old_multiplier:.1f}x to {self.current_cooldown_multiplier:.1f}x "
+                    f"(adjustment #{self.adjustment_count})"
+                )
+                
+                # Apply new multiplier to all categories
+                self._apply_cooldown_multiplier()
+        
+        elif exhaustion_rate < threshold / 2 and self.current_cooldown_multiplier > 1.0:
+            # Recovery: if exhaustion rate is below half the threshold, gradually reduce multiplier
+            if current_time - self.last_adjustment_time > self.adaptive_settings['api_call_window']:
+                old_multiplier = self.current_cooldown_multiplier
+                self.current_cooldown_multiplier = max(
+                    1.0,
+                    self.current_cooldown_multiplier * self.adaptive_settings['cooldown_recovery_rate']
+                )
+                
+                if self.current_cooldown_multiplier == 1.0:
+                    self.adjustment_count = 0
+                    logging.info(
+                        f"Exhaustion rate {exhaustion_rate:.1%} is low. "
+                        f"Cooldowns restored to normal (multiplier: 1.0x)"
+                    )
+                else:
+                    logging.info(
+                        f"Exhaustion rate {exhaustion_rate:.1%} is low. "
+                        f"Reducing cooldown multiplier from {old_multiplier:.1f}x to {self.current_cooldown_multiplier:.1f}x"
+                    )
+                
+                self.last_adjustment_time = current_time
+                self._apply_cooldown_multiplier()
+    
+    def _apply_cooldown_multiplier(self):
+        """
+        Apply the current cooldown multiplier to all category settings.
+        This affects key_cooldown_seconds, exhausted_wait_seconds, and api_call_interval.
+        """
+        # Note: This modifies the runtime values, not the original settings
+        # The actual application happens in the processors
+        pass
+    
+    def get_adjusted_cooldowns(self, category: str) -> dict:
+        """
+        Get the adjusted cooldown settings for a category.
+        
+        Args:
+            category (str): 'free' or 'paid'
+            
+        Returns:
+            dict: Adjusted settings with multiplier applied
+        """
+        base_settings = self.category_settings[category].copy()
+        
+        if self.adaptive_settings['enabled'] and self.current_cooldown_multiplier != 1.0:
+            # Apply multiplier to time-based settings
+            base_settings['key_cooldown_seconds'] *= self.current_cooldown_multiplier
+            base_settings['exhausted_wait_seconds'] *= self.current_cooldown_multiplier
+            
+            # Log when queried (but not too frequently)
+            if hasattr(self, '_last_adjusted_log_time'):
+                if time.time() - self._last_adjusted_log_time > 60:  # Log at most once per minute
+                    logging.debug(f"Using adjusted cooldowns for {category} keys (multiplier: {self.current_cooldown_multiplier:.1f}x)")
+                    self._last_adjusted_log_time = time.time()
+            else:
+                self._last_adjusted_log_time = time.time()
+        
+        return base_settings
+    
+    def get_adaptive_status(self) -> dict:
+        """
+        Get current adaptive cooldown status.
+        
+        Returns:
+            dict: Status information including exhaustion rate and multiplier
+        """
+        with self._adaptive_lock:
+            total_calls = len(self.api_call_history)
+            exhausted_calls = sum(1 for _, was_exhausted in self.api_call_history if was_exhausted)
+            exhaustion_rate = exhausted_calls / total_calls if total_calls > 0 else 0
+            
+            return {
+                'enabled': self.adaptive_settings['enabled'],
+                'current_multiplier': self.current_cooldown_multiplier,
+                'exhaustion_rate': exhaustion_rate,
+                'threshold': self.adaptive_settings['exhaustion_threshold'],
+                'adjustment_count': self.adjustment_count,
+                'total_calls_in_window': total_calls,
+                'exhausted_calls_in_window': exhausted_calls,
+                'window_seconds': self.adaptive_settings['api_call_window']
+            }
 
 class GeminiParallelProcessor:
     """
@@ -682,7 +871,7 @@ class GeminiParallelProcessor:
     """
     def __init__(self, key_manager: AdvancedApiKeyManager, model_name: str,
                  worker_cooldown_seconds: float = 20,  # 20 seconds worker cooldown
-                 api_call_interval: float = 2.0, 
+                 api_call_interval: float = 5.0, 
                  max_workers: int = 4,  # 4 workers by default
                  api_call_retries: int = 3,  # 3 retries by default
                  return_response: bool = False):
@@ -721,6 +910,18 @@ class GeminiParallelProcessor:
             f"with {self.max_workers} workers, worker cooldown {self.worker_cooldown_seconds}s, "
             f"and global API interval {self.api_call_interval}s."
         )
+    
+    def get_adjusted_api_interval(self) -> float:
+        """Get the adjusted API call interval with adaptive multiplier applied."""
+        if self.key_manager.adaptive_settings['enabled']:
+            return self.api_call_interval * self.key_manager.current_cooldown_multiplier
+        return self.api_call_interval
+    
+    def get_adjusted_worker_cooldown(self) -> float:
+        """Get the adjusted worker cooldown with adaptive multiplier applied."""
+        if self.key_manager.adaptive_settings['enabled']:
+            return self.worker_cooldown_seconds * self.key_manager.current_cooldown_multiplier
+        return self.worker_cooldown_seconds
 
 
 
@@ -777,11 +978,12 @@ class GeminiParallelProcessor:
                 with self._api_call_lock:
                     current_time = time.time()
                     time_since_last_call = current_time - self._last_api_call_time
+                    adjusted_interval = self.get_adjusted_api_interval()
                     
-                    if time_since_last_call < self.api_call_interval:
-                        sleep_time = self.api_call_interval - time_since_last_call
+                    if time_since_last_call < adjusted_interval:
+                        sleep_time = adjusted_interval - time_since_last_call
                         worker_id = threading.current_thread().name
-                        logging.debug(f"Worker {worker_id} waiting {sleep_time:.2f}s for global API interval")
+                        logging.debug(f"Worker {worker_id} waiting {sleep_time:.2f}s for global API interval (adjusted: {adjusted_interval:.1f}s)")
                         time.sleep(sleep_time)
                     
                     # Update last API call time before making the call
@@ -938,24 +1140,32 @@ class GeminiParallelProcessor:
             current_time = time.time()
             last_call_time = self.worker_last_call_time.get(worker_id, 0)
             time_since_last_call = current_time - last_call_time
+            adjusted_cooldown = self.get_adjusted_worker_cooldown()
             
-            if time_since_last_call < self.worker_cooldown_seconds:
-                wait_time = self.worker_cooldown_seconds - time_since_last_call
-                logging.debug(f"Worker {worker_id} in cooldown, waiting {wait_time:.1f}s")
+            if time_since_last_call < adjusted_cooldown:
+                wait_time = adjusted_cooldown - time_since_last_call
+                logging.debug(f"Worker {worker_id} in cooldown, waiting {wait_time:.1f}s (adjusted: {adjusted_cooldown:.1f}s)")
                 time.sleep(wait_time)
 
         # Dynamic key allocation - try to get any available key
-        max_attempts = 10000
+        max_wait_time = 3600  # Maximum 1 hour waiting for keys
+        start_time = time.time()
         attempt_count = 0
         
-        while attempt_count < max_attempts:
+        while (time.time() - start_time) < max_wait_time:
             # Get any available key for this task
             current_api_key = self.key_manager.get_any_available_key(worker_id)
 
             if current_api_key == ALL_KEYS_WAITING_MARKER:
                 # All keys are busy, wait and retry
-                logging.debug(f"Worker {worker_id} waiting - all keys busy")
-                time.sleep(10)  # Wait 10 seconds when all keys are busy
+                elapsed = time.time() - start_time
+                if elapsed > max_wait_time / 2:  # After half the time, log warning
+                    logging.warning(f"Worker {worker_id} has been waiting {elapsed:.0f}s for available keys")
+                
+                # Progressive backoff: wait longer as time goes on
+                wait_time = min(30, 10 + (attempt_count // 10) * 5)  # 10s, 15s, 20s, up to 30s
+                logging.debug(f"Worker {worker_id} waiting {wait_time}s - all keys busy (attempt {attempt_count + 1})")
+                time.sleep(wait_time)
                 attempt_count += 1
                 continue
             elif current_api_key is None:
@@ -1000,9 +1210,10 @@ class GeminiParallelProcessor:
                 
                 return metadata, result, None
 
-        # Maximum attempts exceeded
-        logging.error(f"Task {task_id} failed after {max_attempts} key allocation attempts")
-        return metadata, None, f"Failed after {max_attempts} key allocation attempts"
+        # Timeout exceeded
+        elapsed_time = time.time() - start_time
+        logging.error(f"Task {task_id} failed after {elapsed_time:.0f}s of waiting for available keys")
+        return metadata, None, f"Failed: All keys exhausted for {elapsed_time:.0f}s. Keys may need quota reset."
 
     def process_prompts(self, prompts_with_metadata: list[Union[dict, PromptData]]) -> list[tuple]:
         """
@@ -1137,7 +1348,7 @@ class GeminiStreamingProcessor:
     """
     def __init__(self, key_manager: AdvancedApiKeyManager, model_name: str,
                  worker_cooldown_seconds: float = 20,  # 20 seconds worker cooldown
-                 api_call_interval: float = 4.0, 
+                 api_call_interval: float = 5.0, 
                  max_workers: int = 4,  # 4 workers by default
                  api_call_retries: int = 3,  # 3 retries by default
                  return_response: bool = False):
@@ -1183,6 +1394,18 @@ class GeminiStreamingProcessor:
             f"with {self.max_workers} workers, worker cooldown {self.worker_cooldown_seconds}s, "
             f"and global API interval {self.api_call_interval}s."
         )
+    
+    def get_adjusted_api_interval(self) -> float:
+        """Get the adjusted API call interval with adaptive multiplier applied."""
+        if self.key_manager.adaptive_settings['enabled']:
+            return self.api_call_interval * self.key_manager.current_cooldown_multiplier
+        return self.api_call_interval
+    
+    def get_adjusted_worker_cooldown(self) -> float:
+        """Get the adjusted worker cooldown with adaptive multiplier applied."""
+        if self.key_manager.adaptive_settings['enabled']:
+            return self.worker_cooldown_seconds * self.key_manager.current_cooldown_multiplier
+        return self.worker_cooldown_seconds
 
     def start(self):
         """Start the persistent worker pool."""
@@ -1375,24 +1598,32 @@ class GeminiStreamingProcessor:
             current_time = time.time()
             last_call_time = self.worker_last_call_time.get(worker_id, 0)
             time_since_last_call = current_time - last_call_time
+            adjusted_cooldown = self.get_adjusted_worker_cooldown()
             
-            if time_since_last_call < self.worker_cooldown_seconds:
-                wait_time = self.worker_cooldown_seconds - time_since_last_call
-                logging.debug(f"Worker {worker_id} in cooldown, waiting {wait_time:.1f}s")
+            if time_since_last_call < adjusted_cooldown:
+                wait_time = adjusted_cooldown - time_since_last_call
+                logging.debug(f"Worker {worker_id} in cooldown, waiting {wait_time:.1f}s (adjusted: {adjusted_cooldown:.1f}s)")
                 time.sleep(wait_time)
 
         # Dynamic key allocation - grab any available key for each request
-        max_attempts = 10000
+        max_wait_time = 300  # Maximum 5 minutes waiting for keys
+        start_time = time.time()
         attempt_count = 0
         
-        while attempt_count < max_attempts:
+        while (time.time() - start_time) < max_wait_time:
             # Get any available key for this request (no permanent assignment)
             current_api_key = self.key_manager.get_any_available_key(worker_id)
 
             if current_api_key == ALL_KEYS_WAITING_MARKER:
                 # All keys are busy, wait and retry
-                logging.debug(f"Worker {worker_id} waiting - all keys busy")
-                time.sleep(10)  # Wait 10 seconds when all keys are busy
+                elapsed = time.time() - start_time
+                if elapsed > max_wait_time / 2:  # After half the time, log warning
+                    logging.warning(f"Worker {worker_id} has been waiting {elapsed:.0f}s for available keys")
+                
+                # Progressive backoff: wait longer as time goes on
+                wait_time = min(30, 10 + (attempt_count // 10) * 5)  # 10s, 15s, 20s, up to 30s
+                logging.debug(f"Worker {worker_id} waiting {wait_time}s - all keys busy (attempt {attempt_count + 1})")
+                time.sleep(wait_time)
                 attempt_count += 1
                 continue
             elif current_api_key is None:
@@ -1436,9 +1667,10 @@ class GeminiStreamingProcessor:
                 self.key_manager.mark_key_returned(current_api_key, worker_id)
                 return metadata, result, None
 
-        # Maximum attempts exceeded
-        logging.error(f"Task {task_id} failed after {max_attempts} key allocation attempts")
-        return metadata, None, f"Failed after {max_attempts} key allocation attempts"
+        # Timeout exceeded
+        elapsed_time = time.time() - start_time
+        logging.error(f"Task {task_id} failed after {elapsed_time:.0f}s of waiting for available keys")
+        return metadata, None, f"Failed: All keys exhausted for {elapsed_time:.0f}s. Keys may need quota reset."
 
     def _make_single_api_call(self, client_instance, prompt_data: Union[dict, PromptData]) -> str:
         """
@@ -1467,11 +1699,12 @@ class GeminiStreamingProcessor:
                 with self._api_call_lock:
                     current_time = time.time()
                     time_since_last_call = current_time - self._last_api_call_time
+                    adjusted_interval = self.get_adjusted_api_interval()
                     
-                    if time_since_last_call < self.api_call_interval:
-                        sleep_time = self.api_call_interval - time_since_last_call
+                    if time_since_last_call < adjusted_interval:
+                        sleep_time = adjusted_interval - time_since_last_call
                         worker_id = threading.current_thread().name
-                        logging.debug(f"Worker {worker_id} waiting {sleep_time:.2f}s for global API interval")
+                        logging.debug(f"Worker {worker_id} waiting {sleep_time:.2f}s for global API interval (adjusted: {adjusted_interval:.1f}s)")
                         time.sleep(sleep_time)
                     
                     # Update last API call time before making the call
