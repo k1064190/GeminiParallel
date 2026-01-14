@@ -288,51 +288,6 @@ audio = tts.generate_multi_speaker_dialogue(
 )
 ```
 
-## Why Sequential?
-
-Previous versions had "parallel" and "streaming" modes with ThreadPoolExecutor. However, because of IP ban protection, all API calls were **already sequential** (enforced by a global lock). The threading added:
-
-- ❌ 1800 lines of complexity
-- ❌ Lock contention overhead
-- ❌ Difficult debugging
-- ✅ **Zero performance benefit**
-
-The new sequential processor:
-
-- ✅ 696 lines (68% reduction)
-- ✅ No threading overhead
-- ✅ Same throughput
-- ✅ Much easier to understand and debug
-
-## Migration from v0.6.x
-
-**Old code:**
-```python
-# Batch mode
-processor = GeminiParallelProcessor(...)
-results = processor.process_prompts(prompts_data)
-
-# Streaming mode
-processor = GeminiStreamingProcessor(...)
-processor.start()
-result = processor.process_single(prompt_data)
-processor.stop()
-```
-
-**New code:**
-```python
-# Everything is simpler now
-processor = GeminiSequentialProcessor(...)
-
-# Single request
-result = processor.process_single(prompt_data)
-
-# Multiple requests  
-results = processor.process_batch(prompts_data)
-
-# No start()/stop() needed!
-```
-
 ## Environment Variables
 
 Your `.env` file (managed by `geminiparallel` CLI):
@@ -349,24 +304,6 @@ GEMINI_API_KEY_3=your_third_key_here
 ```bash
 echo ".env" >> .gitignore
 ```
-
-## Troubleshooting
-
-**"No valid API keys found"**
-- Run `geminiparallel list` to check your keys
-- Run `geminiparallel test` to validate them
-- Make sure `.env` file is in your working directory
-
-**"All keys exhausted"**
-- Wait for cooldown periods to expire
-- Add more API keys: `geminiparallel add YOUR_KEY`
-- Check your API quotas on Google Cloud Console
-
-**Rate limit errors (429)**
-- The library handles this automatically by trying other keys
-- If all keys are exhausted, wait or add more keys
-- Consider marking keys as paid to remove cooldowns
-
 ## License
 
 MIT License - See LICENSE file for details.
