@@ -483,7 +483,7 @@ class GeminiSequentialProcessor:
         key_manager = AdvancedApiKeyManager(keylist_names="all")
         processor = GeminiSequentialProcessor(
             key_manager=key_manager,
-            model_name="gemini-2.0-flash-001",
+            model_name="gemini-3-flash-preview",
             api_call_interval=4.0
         )
 
@@ -509,7 +509,7 @@ class GeminiSequentialProcessor:
 
         Args:
             key_manager: API key manager instance
-            model_name: Gemini model name (e.g., "gemini-2.0-flash-001")
+            model_name: Gemini model name (e.g., "gemini-3-flash-preview", "gemini-3-pro-preview")
             api_call_interval: Minimum seconds between API calls (IP ban protection, default: 4.0)
             api_call_retries: Maximum retry attempts for API errors
             return_response: If True, return full response object; if False, return text only

@@ -54,7 +54,7 @@ key_manager = AdvancedApiKeyManager(keylist_names="all")
 # Create processor
 processor = GeminiSequentialProcessor(
     key_manager=key_manager,
-    model_name="gemini-2.0-flash-001",
+    model_name="gemini-3-flash-preview",
     api_call_interval=4.0  # IP ban protection (default: 4.0)
 )
 
@@ -246,13 +246,36 @@ Customize AI responses:
 result = processor.process_single({
     'prompt': 'Write a creative story',
     'generation_config': {
-        'temperature': 0.9,
+        'temperature': 1.0,  # Gemini 3: Keep at 1.0 (default, recommended)
         'top_p': 0.8,
-        'max_output_tokens': 1000
+        'max_output_tokens': 1000,
+        'thinking_config': {
+            'thinking_level': 'high'  # minimal, low, medium, high
+        }
     },
     'metadata': {'task_id': 'creative_1'}
 })
 ```
+
+### Gemini 3 Best Practices
+
+**Model Selection**:
+- `gemini-3-flash-preview`: Fast, cost-effective, Pro-level intelligence
+- `gemini-3-pro-preview`: Complex tasks requiring advanced reasoning
+
+**Temperature**: Keep at **1.0** (default). Gemini 3's reasoning is optimized for this value. Lower values may cause looping or degraded performance.
+
+**Thinking Level**: Controls reasoning depth
+- `minimal`: Fastest, minimal thinking (Flash only)
+- `low`: Simple tasks, low latency
+- `medium`: Balanced (Flash only)  
+- `high`: Maximum reasoning (default, dynamic)
+
+**Prompting Tips**:
+- Be **concise and direct** - Gemini 3 prefers clear instructions
+- For large context (books, codebases): place questions **at the end**
+- For verbose responses: explicitly request conversational style
+- Anchor reasoning: "Based on the information above..."
 
 ## Error Handling
 
@@ -287,7 +310,7 @@ The library protects you from IP bans:
 ```python
 processor = GeminiSequentialProcessor(
     key_manager=key_manager,
-    model_name="gemini-2.0-flash-001",
+    model_name="gemini-3-flash-preview",
     api_call_interval=4.0,      # Global rate limit (IP ban protection, default: 4.0)
     api_call_retries=3          # Max retries per request
 )
