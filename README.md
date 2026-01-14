@@ -55,7 +55,7 @@ key_manager = AdvancedApiKeyManager(keylist_names="all")
 processor = GeminiSequentialProcessor(
     key_manager=key_manager,
     model_name="gemini-2.0-flash-001",
-    api_call_interval=2.0  # IP ban protection
+    api_call_interval=4.0  # IP ban protection (default: 4.0)
 )
 
 # Process a single request
@@ -280,7 +280,7 @@ else:
 
 The library protects you from IP bans:
 
-- **API Call Interval** (default 2s) - Minimum time between ANY API calls
+- **API Call Interval** (default 4s) - Minimum time between ANY API calls
 - **Key Cooldown** - Per-key cooldown after use (configurable)
 - **Adaptive Cooldown** - Automatically increases intervals if too many 429 errors
 
@@ -288,7 +288,7 @@ The library protects you from IP bans:
 processor = GeminiSequentialProcessor(
     key_manager=key_manager,
     model_name="gemini-2.0-flash-001",
-    api_call_interval=2.0,      # Global rate limit (IP ban protection)
+    api_call_interval=4.0,      # Global rate limit (IP ban protection, default: 4.0)
     api_call_retries=3          # Max retries per request
 )
 ```

@@ -484,7 +484,7 @@ class GeminiSequentialProcessor:
         processor = GeminiSequentialProcessor(
             key_manager=key_manager,
             model_name="gemini-2.0-flash-001",
-            api_call_interval=2.0
+            api_call_interval=4.0
         )
 
         # Single request
@@ -498,7 +498,7 @@ class GeminiSequentialProcessor:
         self,
         key_manager: AdvancedApiKeyManager,
         model_name: str,
-        api_call_interval: float = 2.0,
+        api_call_interval: float = 4.0,
         api_call_retries: int = 3,
         return_response: bool = False,
         ip_ban_detection_threshold: int = 3,
@@ -510,7 +510,7 @@ class GeminiSequentialProcessor:
         Args:
             key_manager: API key manager instance
             model_name: Gemini model name (e.g., "gemini-2.0-flash-001")
-            api_call_interval: Minimum seconds between API calls (IP ban protection)
+            api_call_interval: Minimum seconds between API calls (IP ban protection, default: 4.0)
             api_call_retries: Maximum retry attempts for API errors
             return_response: If True, return full response object; if False, return text only
             ip_ban_detection_threshold: Number of consecutive exhaustions to trigger IP ban wait (default: 3)
