@@ -4,3 +4,20 @@ __pycache__/
 .python-version
 uv.lock
 .env
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+*.egg
+
+# JS/Node stuff  
+js/node_modules/
+js/.env
+
+# Backup files
+*_backup.py
+*_old.py
+
+# Test files
+test_*.py
