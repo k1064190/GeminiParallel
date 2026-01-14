@@ -277,6 +277,42 @@ result = processor.process_single({
 - For verbose responses: explicitly request conversational style
 - Anchor reasoning: "Based on the information above..."
 
+### Accessing Full Response (Advanced)
+
+By default, `process_single()` returns only the text response. To access the full response object (including thinking process, metadata, etc.):
+
+```python
+# Enable full response mode
+processor = GeminiSequentialProcessor(
+    key_manager=key_manager,
+    model_name="gemini-3-flash-preview",
+    return_response=True  # Return full response object
+)
+
+metadata, response_obj, error = processor.process_single({
+    'prompt': 'Solve this problem step by step',
+    'generation_config': {
+        'thinking_config': {
+            'include_thoughts': True  # Enable thinking process in response
+        }
+    },
+    'metadata': {'task_id': 'advanced_1'}
+})
+
+if not error:
+    # Access thinking process
+    for part in response_obj.candidates[0].content.parts:
+        if hasattr(part, 'thought') and part.thought:
+            print(f"Thinking: {part.thought}")
+        if part.text:
+            print(f"Answer: {part.text}")
+    
+    # Or just get the text
+    print(response_obj.text)
+```
+
+**Note**: The thinking process is only included if `include_thoughts=True` is set in `thinking_config`. By default, only the final answer is returned.
+
 ## Error Handling
 
 The library handles errors automatically:
