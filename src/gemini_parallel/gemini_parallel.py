@@ -102,6 +102,7 @@ class AdvancedApiKeyManager:
             "exhausted_wait_seconds": 120,
             "fully_exhausted_wait_seconds": 43200,
             "max_exhausted_retries": 3,
+            "consecutive_exhaustion_lockout_seconds": 43200,  # 12 hours
         }
 
         default_paid_settings = {
@@ -109,6 +110,7 @@ class AdvancedApiKeyManager:
             "exhausted_wait_seconds": 120,
             "fully_exhausted_wait_seconds": 43200,
             "max_exhausted_retries": 3,
+            "consecutive_exhaustion_lockout_seconds": 43200,  # 12 hours
         }
 
         if key_settings is None:
@@ -142,6 +144,7 @@ class AdvancedApiKeyManager:
                 "last_used_time": 0,
                 "status_change_time": 0,
                 "exhausted_count": 0,
+                "consecutive_exhausted_count": 0,  # Track consecutive exhaustions
                 "total_exhausted_count": 0,
                 "category": "paid" if is_paid else "free",
                 "env_name": env_name,
@@ -241,11 +244,12 @@ class AdvancedApiKeyManager:
             # Apply adaptive multiplier to cooldown settings
             adjusted_settings = settings.copy()
             if self.adaptive_settings["enabled"]:
-                adjusted_settings["key_cooldown_seconds"] *= (
-                    self.current_cooldown_multiplier
+                adjusted_settings["key_cooldown_seconds"] = int(
+                    settings["key_cooldown_seconds"] * self.current_cooldown_multiplier
                 )
-                adjusted_settings["exhausted_wait_seconds"] *= (
-                    self.current_cooldown_multiplier
+                adjusted_settings["exhausted_wait_seconds"] = int(
+                    settings["exhausted_wait_seconds"]
+                    * self.current_cooldown_multiplier
                 )
 
             if info["status"] == KEY_STATUS_COOLDOWN:
@@ -346,12 +350,23 @@ class AdvancedApiKeyManager:
 
         info = self.key_info[api_key]
         info["exhausted_count"] += 1
+        info["consecutive_exhausted_count"] += 1
         info["total_exhausted_count"] += 1
 
         category = info["category"]
         max_retries = self.category_settings[category]["max_exhausted_retries"]
 
-        if info["exhausted_count"] >= max_retries:
+        # Check if key hit consecutive exhaustion limit (3 times → 12 hour lockout)
+        if info["consecutive_exhausted_count"] >= 3:
+            lockout_seconds = self.category_settings[category][
+                "consecutive_exhaustion_lockout_seconds"
+            ]
+            info["status"] = KEY_STATUS_FULLY_EXHAUSTED
+            info["status_change_time"] = time.time()
+            logging.error(
+                f"Key ...{api_key[-4:]} locked out for {lockout_seconds / 3600:.1f} hours after 3 consecutive exhaustions"
+            )
+        elif info["exhausted_count"] >= max_retries:
             info["status"] = KEY_STATUS_FULLY_EXHAUSTED
             info["status_change_time"] = time.time()
             logging.warning(
@@ -367,6 +382,11 @@ class AdvancedApiKeyManager:
         # Track for adaptive cooldown
         self.api_call_history.append((time.time(), True))
         self._adjust_cooldown_if_needed()
+
+    def mark_key_success(self, api_key: str):
+        """Reset consecutive exhaustion counter on successful API call."""
+        if api_key in self.key_info:
+            self.key_info[api_key]["consecutive_exhausted_count"] = 0
 
     def mark_key_failed_init(self, api_key: str):
         """Mark a key as failed during initialization."""
@@ -481,6 +501,8 @@ class GeminiSequentialProcessor:
         api_call_interval: float = 2.0,
         api_call_retries: int = 3,
         return_response: bool = False,
+        ip_ban_detection_threshold: int = 3,
+        ip_ban_wait_seconds: int = 300,
     ):
         """
         Initialize the sequential processor.
@@ -491,19 +513,27 @@ class GeminiSequentialProcessor:
             api_call_interval: Minimum seconds between API calls (IP ban protection)
             api_call_retries: Maximum retry attempts for API errors
             return_response: If True, return full response object; if False, return text only
+            ip_ban_detection_threshold: Number of consecutive exhaustions to trigger IP ban wait (default: 3)
+            ip_ban_wait_seconds: Seconds to wait when IP ban is detected (default: 300 = 5 minutes)
         """
         self.key_manager = key_manager
         self.model_name = model_name
         self.api_call_interval = api_call_interval
         self.api_call_retries = api_call_retries
         self.return_response = return_response
+        self.ip_ban_detection_threshold = ip_ban_detection_threshold
+        self.ip_ban_wait_seconds = ip_ban_wait_seconds
 
         # Simple timing control - no locks needed (single-threaded)
         self.last_api_call_time = 0.0
 
+        # Track consecutive exhaustions for IP ban detection
+        self.consecutive_exhaustions = 0
+
         logging.info(
             f"GeminiSequentialProcessor initialized for model '{self.model_name}' "
-            f"with API interval {self.api_call_interval}s"
+            f"with API interval {self.api_call_interval}s, "
+            f"IP ban detection: {self.ip_ban_detection_threshold} exhaustions → {self.ip_ban_wait_seconds}s wait"
         )
 
     def _enforce_api_interval(self):
@@ -751,12 +781,29 @@ class GeminiSequentialProcessor:
                     f"Key ...{api_key[-4:]} exhausted for task {task_id}, trying another key"
                 )
                 self.key_manager.mark_key_exhausted(api_key)
+                self.consecutive_exhaustions += 1
+
+                # IP ban detection: N consecutive exhaustions → wait
+                if self.consecutive_exhaustions >= self.ip_ban_detection_threshold:
+                    logging.error(
+                        f"IP BAN DETECTED: {self.consecutive_exhaustions} consecutive exhaustions. "
+                        f"Waiting {self.ip_ban_wait_seconds}s before retrying..."
+                    )
+                    time.sleep(self.ip_ban_wait_seconds)
+                    self.consecutive_exhaustions = 0  # Reset counter after wait
+                    logging.info("IP ban wait complete, resuming operations")
+
                 continue
             elif result == PERSISTENT_ERROR_MARKER:
                 logging.error(f"Task {task_id} failed with persistent error")
+                self.consecutive_exhaustions = 0  # Reset on non-exhaustion result
                 return metadata, None, "Persistent API error"
             else:
                 logging.info(f"Task {task_id} completed successfully")
+                self.consecutive_exhaustions = 0  # Reset on success
+                self.key_manager.mark_key_success(
+                    api_key
+                )  # Reset key's consecutive counter
                 return metadata, result, None
 
         logging.error(
