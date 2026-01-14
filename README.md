@@ -119,6 +119,42 @@ geminiparallel list
 
 ## Multi-Modal Usage
 
+### Image Processing
+
+```python
+# Single image from file
+result = processor.process_single({
+    'prompt': 'Describe this image: <image>',
+    'image_path': '/path/to/image.jpg',
+    'metadata': {'task_id': 'image_1'}
+})
+
+# Image from URL
+result = processor.process_single({
+    'prompt': 'What is in this image?',
+    'image_url': 'https://example.com/image.jpg',
+    'metadata': {'task_id': 'image_2'}
+})
+
+# Image from bytes
+with open('/path/to/image.png', 'rb') as f:
+    image_bytes = f.read()
+
+result = processor.process_single({
+    'prompt': 'Analyze this image: <image>',
+    'image_bytes': image_bytes,
+    'image_mime_type': 'image/png',
+    'metadata': {'task_id': 'image_3'}
+})
+
+# Multiple images
+result = processor.process_single({
+    'prompt': 'Compare <image> with <image>',
+    'image_path': ['/path/to/image1.jpg', '/path/to/image2.jpg'],
+    'metadata': {'task_id': 'multi_image'}
+})
+```
+
 ### Audio Processing
 
 ```python
@@ -143,9 +179,10 @@ result = processor.process_single({
 
 ```python
 result = processor.process_single({
-    'prompt': 'Compare <audio> with <video> and analyze <audio>',
-    'audio_path': ['audio1.mp3', 'audio2.wav'],
-    'video_path': ['video1.mp4'],
+    'prompt': 'Describe <image>, then transcribe <audio>, and summarize <video>',
+    'image_path': '/path/to/image.jpg',
+    'audio_path': 'audio1.mp3',
+    'video_path': 'video1.mp4',
     'metadata': {'task_id': 'multi_1'}
 })
 ```
