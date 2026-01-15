@@ -313,6 +313,41 @@ if not error:
 
 **Note**: The thinking process is only included if `include_thoughts=True` is set in `thinking_config`. By default, only the final answer is returned.
 
+## Image Generation (Nano Banana)
+
+Generate and edit images using the `GeminiImageGenerator`.
+
+### Text-to-Image
+
+```python
+from gemini_parallel import GeminiImageGenerator, AdvancedApiKeyManager
+
+key_manager = AdvancedApiKeyManager(keylist_names="all")
+generator = GeminiImageGenerator(
+    key_manager=key_manager,
+    model_name="gemini-3-pro-image-preview"  # or gemini-2.5-flash-image
+)
+
+# Generate an image
+image = generator.generate_image(
+    prompt="A futuristic city with flying cars at sunset, cyberpunk style",
+    output_file="city.png",
+    aspect_ratio="16:9",
+    image_size="2K"  # 1K, 2K, 4K (Pro only)
+)
+```
+
+### Image Editing
+
+```python
+# Edit an existing image
+edited_image = generator.edit_image(
+    prompt="Make it snowy",
+    input_image="city.png",
+    output_file="city_snowy.png"
+)
+```
+
 ## Error Handling
 
 The library handles errors automatically:

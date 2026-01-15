@@ -1,3 +1,0 @@
-google-genai
-google-api-core
-python-dotenv

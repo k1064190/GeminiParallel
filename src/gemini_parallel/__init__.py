@@ -11,11 +11,13 @@ from .gemini_tts import (
     TTS_VOICES,
     TTS_MODELS,
 )
+from .gemini_image_generator import GeminiImageGenerator
 from . import prompt_types
 
 __all__ = [
     "GeminiSequentialProcessor",
     "AdvancedApiKeyManager",
+    "GeminiImageGenerator",
     "prepare_media_contents",
     "GeminiTTSProcessor",
     "text_to_speech",
